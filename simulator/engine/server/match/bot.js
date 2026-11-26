@@ -96,7 +96,7 @@ import { planProtected } from './aiEconomy.js';
 import { createPrepSteps } from './botPrep.js';
 import { refineFormationSteps } from './botFormationCandidates.js';
 import { ASPD_MIN, COLS as SIM_COLS, TICK } from '../sim/constants.js';
-import { rehearsalCap, RehearsalRun } from '../sim/rehearsal.js';
+import { rehearsalCap, RehearsalRun, FA_LEAK_SECONDS } from '../sim/rehearsal.js';
 import { Grid } from '../sim/grid.js';
 import { deriveSeed } from '../sim/rng.js';
 import { freeSlot, countFree, legalTiles, canPlace, positionClass, placeClass, basePositionClass, parseKey, tileKey, FIELD, pieceDir, boardTileOf, BOSS_MIRROR_COL } from './board.js';
@@ -198,6 +198,25 @@ const COOP_BENCH_BUDGET = 4;
 const LEVEL_TARGET = [1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5];
 const BOT_MAX_LEVEL = 5;
 /**
+ * ArkRunner local branch (opt-in `fastLevel`, 规程 only): every early level one round sooner — L2 at R2, L3 at R4, L4 at
+ * R6. On 终极 the enemies' HP factor goes 2.24 → 4.21 from R6 to R7 (5.47 at R8) while the boards' damage grows × 1.6:
+ * in 1800 recorded matches a seat leaks 1.6 enemies at R6 and 8.8 at R7, and in 80–90 % of the R7–R9 fields every
+ * rehearsed layout leaks. The season's guides reach L4 at R4–R6.
+ */
+const LEVEL_TARGET_FAST = [1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5];
+/**
+ * ArkRunner local branch (opt-in `lateLevel`, 规程 only): L4 at R8 and L5 at R10, one round later. A level-up round
+ * spends its income on the step (R7: 9 of 10 funds) and buys 0.3–0.7 pieces, and on 终极 R7 is the round the enemies' HP
+ * factor jumps 2.24 → 4.21. In 1800 recorded matches the seats whose L4 slipped to R8 leaked 6.25 at R7 against 9.25
+ * (L5 slipped to R10: 6.35 against 8.62 at R9) and the same at the next round. `fastLevel` was measured flat.
+ */
+const LEVEL_TARGET_LATE = [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 5, 5, 5];
+function levelTargetAt(m, r) {
+  const t = !isRegulation(m) ? LEVEL_TARGET
+    : expOn(m, 'fastLevel') ? LEVEL_TARGET_FAST : expOn(m, 'lateLevel') ? LEVEL_TARGET_LATE : LEVEL_TARGET;
+  return t[Math.min(t.length - 1, r)];
+}
+/**
  * AI 托管 of a human with 自选 picks (0.2.0; bots field none): the buy score of one of the player's own slotted pieces —
  * the operator the player chose to field (follow-up #13: under AI 托管 they were rarely bought) — and the 调度中心 is
  * levelled one round earlier for the step that opens a slotted tier (levelUp).
@@ -259,8 +278,26 @@ const BAND_STRENGTH_POWER = 6;
  * 113 → 111 — the table measures solo play, co-op about even. 1 off 终极 (only the default version has 终极: the other
  * versions' modes stop at 绝境); a band missing from the table (plugin data) counts as the mean.
  */
+/**
+ * ArkRunner local branch: the bots' own results with 规程's strategies. The table above measured the default version;
+ * 规程 has 61 strategies, 44 of them not in it, and the 17 shared ids changed their effects and starting LP (阿米娅 was
+ * first there and is among the worst here). Points of the team's leader-pool completion with a seat on the strategy
+ * against the average match — a ridge regression over four-seat 终极 matches of the pinned bot, strategies seen in at
+ * least 10 of them (stronghold-training artifacts/botlab/step1/legacy, seeds 700001–700200); the others count as 0.
+ * [ASSUMED] The pick multiplier keeps the upstream form: (1 + REG_BAND_SHRINK × points / REG_BAND_MEAN)^6.
+ */
+const REG_BAND_POINTS = Object.freeze({
+  band_qalaisa: 8.7, band_emperor: 8.1, band_upgrade: 8.0, band_cannot: 5.5, band_protect: 3.9, band_survive: 0.9,
+  band_ioleta: 0.3, band_copy: -1.0, band_breakaway: -3.1, band_high: -3.3, band_smith: -4.4, band_dance: -7.3,
+  band_substitute: -8.1, band_price: -9.6, band_equipment: -9.7, band_amiya: -13.2, band_mech: -18.4,
+});
+const REG_BAND_MEAN = 40;
+const REG_BAND_SHRINK = 0.6;
+const isRegulation = (m) => String(m.gd?.raw?.config?.version?.id || '').startsWith('act3');
+
 export function bandStrength(m, id) {
   if (m.difficulty !== 'ABYSS') return 1;
+  if (isRegulation(m) && regOn(m, 'bandTable')) return (1 + REG_BAND_SHRINK * (REG_BAND_POINTS[id] || 0) / REG_BAND_MEAN) ** BAND_STRENGTH_POWER;
   const s = Object.hasOwn(BAND_STRENGTH, id) ? BAND_STRENGTH[id] : BAND_STRENGTH_MEAN;
   return ((BAND_STRENGTH_MEAN + BAND_STRENGTH_SHRINK * (s - BAND_STRENGTH_MEAN)) / 50) ** BAND_STRENGTH_POWER;
 }
@@ -758,7 +795,7 @@ export function botIntent(m, ps, kind) {
   const pager = pagerSeatPeek(m, ps);
   const main = gd.bandBondIds(ps.bandId).find((id) => gd.bond(id)?.isCore && !botBondUnavailable(m, id)) ?? (pager ? PAGER_BOND : null);
   const focus = main ?? focusBond(m, ps, owned, teammateBonds(m, ps), null);
-  return { focus, second: secondBond(m, owned, focus), levelTarget: Math.min(LEVEL_TARGET[Math.min(LEVEL_TARGET.length - 1, m.round)], BOT_MAX_LEVEL),
+  return { focus, second: secondBond(m, owned, focus), levelTarget: Math.min(levelTargetAt(m, m.round), BOT_MAX_LEVEL),
     route: pager ? 'pager' : null };
 }
 
@@ -1017,6 +1054,29 @@ function bondValue(m, c, owned, focus, second = null) {
 }
 
 /**
+ * ArkRunner local branch (opt-in `engineAny`): a layer engine (engineFor: 「自身已激活的盟约层数+N」 霍尔海雅, …) of one of
+ * its own bonds other than the focus. Its layers stay (IN_BATTLE gains settle as permanent ones), so it is worth more
+ * the more rounds are left: ENGINE_BONUS × rounds-left / 4 (0.5–1.5) when this copy activates the bond, half of it when
+ * one more member would and the pool still has one in reach. Without either the engine adds nothing (seen live
+ * 2026-11-23: 霍尔海雅 offered with no 奥术 / 精准 member owned).
+ */
+function otherEngineBonus(m, ps, c, ctx) {
+  const gd = ps?.gd || m.gd;
+  if (!(m.round < gd.bossRound) || ctx.owned.bases.has(gd.baseIdOf(c.chessId))) return 0;
+  const left = Math.max(0.5, Math.min(1.5, (gd.bossRound - m.round) / 4));
+  let best = 0;
+  for (const b of c.bonds || []) {
+    if (b === ctx.focus || !engineFor(m, c, b) || botBondUnavailable(m, b)) continue;
+    const th = gd.bond(b)?.thresholds;
+    const first = Array.isArray(th) && th.length ? th[0] : 2;
+    const n = ctx.owned.counts.get(b) || 0;
+    if (n + 1 >= first) best = Math.max(best, ENGINE_BONUS * left);
+    else if (n + 2 >= first && bondReach(m, ps, b, ctx.owned) > n + 1) best = Math.max(best, ENGINE_BONUS * left / 2);
+  }
+  return best;
+}
+
+/**
  * Power of a chess record. Base stats barely grow with the tier (research 03: T1 E1 Lv55 … T6 E2 Lv1); higher tiers
  * bring better skills and talents, elites (精锐) +25 % stats and skill level 7 — so the tier weight is modest and the
  * elite weight large.
@@ -1063,6 +1123,12 @@ export function engineFor(m, c, bond) {
   for (const gid of c.garrisonIds || []) {
     const g = m.gd.garrison(gid);
     const text = String(g?.desc || '');
+    // ArkRunner local branch [ASSUMED]: 规程's 乌萨斯 banks its kills as temporary layers, which only a converter (折桠,
+    // 乌啾: 「转化N层【乌萨斯】临时层数为固定层数」, SERVER_CONVERT_TEMP_BOND*) makes permanent — the bond's engine
+    if (g && regOn(m, 'engConvert') && String(g.effectKey).startsWith('SERVER_CONVERT_TEMP_BOND') && g.bbStr?.bond === bond) {
+      yes = true;
+      break;
+    }
     if (!g || g.eventType === 'SERVER_GAIN' || !/层数\+/.test(text)) continue;
     if ((name && text.includes(`【${name}】`)) || (/自身(所属|已激活)的?盟约/.test(text) && (c.bonds || []).includes(bond))) {
       yes = true;
@@ -1073,11 +1139,34 @@ export function engineFor(m, c, bond) {
   return yes;
 }
 
+/**
+ * ArkRunner local branch [ASSUMED]: 规程's general layer cards (season guides: 空弦, 渡桥, 青枳, 华法琳, 佩佩, 帕拉斯 —
+ * 「优质通用叠层卡」) add layers every round to whatever bonds the operator next to them has active, the focus included,
+ * without being a member of it. engineFor and the trait census valued them like any card of their tier: in 60 pinned
+ * 终极 matches (artifacts/botlab/diag1) under 6 % of the seats fielded 空弦 or 渡桥 at R9, and 帕拉斯 and 华法琳 sat on
+ * the bench. Worth the layers a round they give a neighbour × the rounds left (at most SUPPORT_ROUNDS)
+ * / SUPPORT_LAYERS_PER_POINT, at most SUPPORT_CAP — to buy and to field; positionPlanSteps still places them.
+ */
+const SUPPORT_ROUNDS = 6;
+const SUPPORT_LAYERS_PER_POINT = 3;
+const SUPPORT_CAP = 14;
+function supportBonus(m, ps, c) {
+  if (!c || !regOn(m, 'support') || !isRegulation(m) || m.round >= m.gd.bossRound) return 0;
+  let layers = 0;
+  for (const t of positionTraitsOf(m, ps, c)) {
+    if (t.kind === 'pos' || t.kind === 'posBattle' || t.kind === 'posSell') layers += t.n;
+    else if (t.kind === 'grant') layers += 3.5;
+    else if (t.kind === 'extra' || t.kind === 'cap') layers += 4 * t.n;
+  }
+  return layers ? Math.min(SUPPORT_CAP, layers * Math.min(SUPPORT_ROUNDS, m.gd.bossRound - m.round) / SUPPORT_LAYERS_PER_POINT) : 0;
+}
+
 /** Stand-alone value of an owned piece (no bond context): power, items, role fit, layer engines. */
 function unitBase(m, piece, ctx) {
   const c = chessRec(m, piece.id, ctx.ps);
   if (!c) return 0;
   let v = power(c) + (piece.items ? piece.items.length * 5 : 0) + PLAN_UNIT_SHARE * planUnitWeight(m, ctx.ps, piece.id);
+  v += supportBonus(m, ctx.ps, c);
   if (m.round <= 11) v += traitsOf(m, c).recurring * 4;
   // §37.36: layers stop growing in the Final Assault
   if (m.round < m.gd.bossRound && engineFor(m, c, ctx.focus)) v += ENGINE_BONUS;
@@ -1123,7 +1212,8 @@ function lineupScore(m, ps, set, ctx, handSlots = countFree(ps.hand)) {
     if (!b.tier) continue;
     const bond = gd.bond(id);
     const w = bond && bond.isCore ? 14 : 9;
-    v += b.tier * w + Math.min(12, (b.layers || 0) * 0.1) + (id === ctx.focus ? 6 : 0) + (bond?.isCore && b.tier >= 2 ? CORE_TOP_TIER : 0);
+    const layerTerm = expOn(m, 'layerValue') ? b.tier * w * layerScale(gd, id, b.layers || 0) : Math.min(12, (b.layers || 0) * 0.1);
+    v += b.tier * w + layerTerm + (id === ctx.focus ? 6 : 0) + (bond?.isCore && b.tier >= 2 ? CORE_TOP_TIER : 0);
     // §37.43 [ASSUMED]: the top tier of a core bond whose top threshold exceeds the deploy cap (炎 9: two 炎佑, ×1.5 attack,
     // −90 % damage taken) is worth more than one more tier
     if (bond?.isCore && Array.isArray(bond.thresholds) && b.tier === bond.thresholds.length && bond.thresholds[bond.thresholds.length - 1] > ps.deployCap) v += TOP_ABOVE_CAP;
@@ -1139,6 +1229,27 @@ function lineupScore(m, ps, set, ctx, handSlots = countFree(ps.hand)) {
   v -= Math.max(0, healers - 2) * 10;
   if (m.round >= HEAL_FROM && m.isSolo && !damage) v += Math.min(healers, 1) * HEAL_FIRST + (healers >= 2 && m.round >= 9 ? HEAL_SECOND : 0);
   return v;
+}
+
+/**
+ * ArkRunner local branch (opt-in `layerValue`): how much the bond's layers add to its effect, relative to the effect at no
+ * layer — the first of its per-stack parameters over its base one in the bond effect's blackboard (坚守: max HP +25 %
+ * base, +1.2 % a layer: 68 layers = ×3.3 the base), at most LAYER_SCALE_CAP. lineupScore weighed every bond's layers
+ * 0.1 a layer up to 12 points, so a 68-layer 坚守 (+107 % max HP to every operator) was sold for a sixth 叙拉古 (live
+ * 2026-11-23). 0 when the bond has no such pair of parameters.
+ */
+const LAYER_SCALE_CAP = 4;
+function layerScale(gd, bondId, layers) {
+  if (!(layers > 0)) return 0;
+  const bond = gd.bond(bondId);
+  const effect = bond && gd.effect(bond.effectId);
+  const bb = effect?.buffs?.[0]?.bb || {};
+  const bases = Array.isArray(bond?.baseParams) ? bond.baseParams : [], pers = Array.isArray(bond?.perStackParams) ? bond.perStackParams : [];
+  for (let i = 0; i < Math.min(bases.length, pers.length); i++) {
+    const base = Number(bb[bases[i]]), per = Number(bb[pers[i]]);
+    if (base > 0 && per > 0) return Math.min(LAYER_SCALE_CAP, (per * layers) / base);
+  }
+  return 0;
 }
 
 /**
@@ -1233,6 +1344,8 @@ function buyScore(m, ps, id, ctx) {
   const tr = traitsOf(m, c);
   if (m.round <= 11) s += tr.recurring * 3 + tr.gain * 2 + tr.econ * (m.round <= 7 ? 2 : 0);
   if (m.round < m.gd.bossRound && engineFor(m, c, ctx.focus)) s += ENGINE_BONUS;
+  if (expOn(m, 'engineAny')) s += otherEngineBonus(m, ps, c, ctx);
+  s += supportBonus(m, ps, c);
   const base = gd.baseIdOf(id);
   if (!c.isGolden) {
     const copies = ctx.copies.get(base) || 0;
@@ -1490,10 +1603,22 @@ export function fieldModel(m, ps = null, body = false) {
     });
   });
   const flyTotal = routesOut.filter((r) => r.fly).reduce((s, r) => s + r.n, 0);
+  // ArkRunner local branch: 规程's special ground on the normal field (board tile = stage tile there): 活性源石 (m04) and
+  // 隐匿草丛 (m09). The pinned bot knows the 气流 of the default version only; on these two maps it reached the Final
+  // Assault in 28 % and 43 % of 200 终极 matches, against 67–86 % on the maps without special ground.
+  const terrain = new Map();
+  if (!boss && st && Array.isArray(st.rows) && expOn(m, 'terrain')) {
+    for (let r = FIELD.r0; r <= FIELD.r1; r++) for (let c = FIELD.c0; c <= FIELD.c1; c++) {
+      const tk = st.tiles?.[st.rows[r]?.[c]]?.tileKey;
+      if (tk === 'tile_infection') terrain.set(tileKey(r, c), 'infection');
+      else if (tk === 'tile_duel_grassland') terrain.set(tileKey(r, c), 'grass');
+    }
+  }
   let wsum = 0;
   for (const w of foes.values()) wsum += w;
   const armor = [...foes.entries()].map(([k, w]) => { const [def, res] = k.split('|').map(Number); return { def, res, w: w / wsum }; });
   m[slot] = { key: cacheKey, routes: routesOut, index, ground, flyTotal, airflow: airflowOf(st, toBoard, boss && boss.side === 'R'), armor, dps: new Map(),
+    terrain: terrain.size ? terrain : null,
     lead: leadTiles.size ? { tiles: leadTiles, strike: strikeTiles.size ? strikeTiles : null } : null };
   return m[slot];
 }
@@ -1618,6 +1743,8 @@ function armorFit(model, rec) {
   return raw > 0 ? effDps(model, rec) / raw : 1;
 }
 
+/** ArkRunner local branch [ASSUMED]: share of a hold that is left against enemies carrying 活性源石's ATK and ASPD. */
+const INFECTED_HOLD = 0.75;
 /** Tunables of the exposure model (tuned offline against the real simulation, tools/matchrun.mjs sweeps). */
 export const LAYOUT_PARAMS = Object.freeze({ hold: 4, kill: 1.5, secondHold: 0.5, healHold: 0.5, roadPenalty: 0.15, spread: 99 });
 
@@ -1651,18 +1778,25 @@ class Layout {
     const blockAt = new Map();
     for (const u of this.units) if (u.block > 0 && this.model.ground.has(u.key)) blockAt.set(u.key, (blockAt.get(u.key) || 0) + u.block);
     let total = 0;
+    const terrain = this.model.terrain;
     for (const rt of routes) {
       let exp = 0;
       let lastBlock = -Infinity;
+      let infected = false;
       for (let i = 0; i < rt.tiles.length; i++) {
         const k = rt.tiles[i];
-        let t = rt.tileTime + (i < 2 && rt.dwell ? rt.dwell : 0);
+        const ground = terrain && !rt.fly ? terrain.get(k) : null;
+        // ArkRunner local branch [ASSUMED]: a ground enemy on 隐匿草丛 cannot be targeted until an operator blocks it
+        // (sim targeting.js enemyStealthed) — its walking time there is no exposure, the held time is
+        let t = ground === 'grass' ? 0 : rt.tileTime + (i < 2 && rt.dwell ? rt.dwell : 0);
         if (!rt.fly && blockAt.has(k)) {
           // a blocker right behind another one mostly holds what slipped past; a separate line holds again
           const fresh = i - lastBlock >= p.spread;
-          t += p.hold * blockAt.get(k) * (fresh ? 1 : p.secondHold) * (1 + p.healHold * Math.min(2, healCover.get(k) || 0));
+          // an enemy that crossed 活性源石 hits 20 % harder and faster for the rest of its way: the hold is shorter
+          t += p.hold * blockAt.get(k) * (fresh ? 1 : p.secondHold) * (1 + p.healHold * Math.min(2, healCover.get(k) || 0)) * (infected ? INFECTED_HOLD : 1);
           lastBlock = i;
         }
+        if (ground === 'infection') infected = true;
         const c = cover.get(k);
         if (c) exp += t * (rt.fly ? c.a : c.g);
       }
@@ -1692,6 +1826,11 @@ class Layout {
         }
         if (p.strikeSafe > 0 && !U[i].block && strike.has(U[i].key)) total -= p.strikeSafe * FA_BODY_WEIGHT * dps(U[i]);
       }
+    }
+    // ArkRunner local branch: a walking leader that hurts everything around it (leaderAuraPlansSteps): a unit standing
+    // inside the area is not there for long
+    if (p.aura instanceof Set && p.auraSafe > 0) {
+      for (const u of this.units) if (p.aura.has(u.key)) total -= p.auraSafe * FA_BODY_WEIGHT * Math.max(u.dps, STRIKE_DPS_FLOOR);
     }
     // ranged units standing on a road block and get hit: a small penalty per road tile they occupy
     for (const u of this.units) if (!u.block && this.model.ground.has(u.key)) total -= p.roadPenalty * this.model.ground.get(u.key).flow;
@@ -1780,7 +1919,12 @@ export function* planLayoutSteps(m, ps, pieces, params = LAYOUT_PARAMS, { occupi
     let bestHealing = -Infinity;
     let bestNoise = -Infinity;
     const healed = new Set(layout.units.filter((u) => u.heal).flatMap((u) => [...u.cover]));
-    for (const [r, c] of legalTiles(map, cls)) {
+    // ArkRunner local branch [ASSUMED]: an operator on 活性源石 loses 70 HP a second for as long as it stands there
+    // (sim devices.js touchInfection) — not while another legal tile is free
+    const usable = (r, c) => { const k = tileKey(r, c); return !taken.has(k) && !(within && !within.has(k)) && !(without && without.has(k)); };
+    const tilesOf = [...legalTiles(map, cls)];
+    const clean = model.terrain ? tilesOf.filter(([r, c]) => model.terrain.get(tileKey(r, c)) !== 'infection') : tilesOf;
+    for (const [r, c] of (clean.some(([r, c]) => usable(r, c)) ? clean : tilesOf)) {
       const k = tileKey(r, c);
       if (taken.has(k) || (within && !within.has(k)) || (without && without.has(k))) continue;
       const noise = m.rngBots() * 1e-6;
@@ -1839,7 +1983,7 @@ export function* planLayoutSteps(m, ps, pieces, params = LAYOUT_PARAMS, { occupi
     let bestV = layout.value();
     for (const [r, c] of legalTiles(map, placeClass(ps, pgd.chess(p.id) || r0))) {
       const k = tileKey(r, c);
-      if (taken.has(k) || !model.ground.has(k) || !support(k)) continue;
+      if (taken.has(k) || !model.ground.has(k) || !support(k) || model.terrain?.get(k) === 'infection') continue;
       const candidate = unitOf(r0, k, r, c, unit.dir, model);
       layout.units[index] = candidate;
       const v = layout.value();
@@ -1903,7 +2047,7 @@ function plannedBoard(byUid, plan) {
  * `waveSpawns` is the field's wave before the bounties, the same copy the live boss start passes (GitHub #839).
  * @returns {object|null}
  */
-function bossCandidateOpts(m, ps, byUid, plan) {
+export function bossCandidateOpts(m, ps, byUid, plan) {
   const g = typeof m.bossGroupOf === 'function' ? m.bossGroupOf(ps) : null;
   const wave = g && g.wave;
   if (!wave || !m.dispatcher) return null;
@@ -2027,7 +2171,16 @@ export function createRehearsalJob(m, ps, chosen, plans, inputs, prebuilt = null
     chosen, plans, inputs, cap: ticks, limits, stats: null, best: plans[0], done: false, pending: false,
     run(budgetMs = Infinity, control = null) {
       if (job.done) return true;
-      if (!run) run = new RehearsalRun(factories, ps.playerId, ticks, limits || {});
+      if (!run) {
+        run = new RehearsalRun(factories, ps.playerId, ticks, limits || {});
+        // ArkRunner local branch (opt-in `faLp`): a boss field's candidates ranked with the LP they cost (rehearsal.js faSeconds)
+        if (expOn(m, 'tieUseful')) run.score.tieUseful = true;
+        if (!m.wave && expOn(m, 'faLp')) {
+          // (the merged LP is set when the Final Assault starts: during its prep it is the alive players' sum)
+          const lp = Number.isFinite(m.teamLp) ? m.teamLp : (typeof m.alivePlayers === 'function' ? m.alivePlayers() : m.order).reduce((n, p) => n + Math.max(0, p.lp || 0), 0);
+          if (lp > 0) run.score.lp = lp;
+        }
+      }
       // A test replay (`control.replaying`) stops on the journalled step count, not the wall clock.
       const replaying = !!(control && control.replaying);
       const timed = !replaying && Number.isFinite(budgetMs);
@@ -2036,6 +2189,15 @@ export function createRehearsalJob(m, ps, chosen, plans, inputs, prebuilt = null
       job.done = run.run(timed || replaying ? over : null, control);
       job.best = job.plans[run.score.index] || job.best;
       if (countLead && job.done) ps._botFaLead = { round: m.round, lead: leads[run.score.index] || null };
+      // ArkRunner local branch (opt-in `faSwap`): battle-tested bench swaps on the rehearsed leader-field plan
+      if (job.done && !job.faSwapped && !m.wave && expOn(m, 'faSwap')) {
+        job.faSwapped = true;
+        const sw = faSwapPlan(m, ps, job.chosen, job.best);
+        if (sw) {
+          job.best = sw.plan; job.chosen = sw.chosen; job.faSwaps = sw.log;
+          if (countLead) ps._botFaLead = { round: m.round, lead: sw.lead };
+        }
+      }
       job.stats = { totalTicks: run.totalTicks, completed: run.completed, considered: run.index,
         stopReason: run.stopReason, choice: run.score.index, candidates: factories.length };
       return job.done;
@@ -2538,8 +2700,8 @@ export function levelUp(m, ps, { spare = false, policy = null } = {}) {
     const r = m.round;
     // §37.38: never past BOT_MAX_LEVEL — except toward a human's own 自选 slots of the next level (AI 托管)
     if (ps.shop.level >= BOT_MAX_LEVEL && !diyOpensAt(ps, ps.shop.level + 1)) return;
-    const target = LEVEL_TARGET[Math.min(LEVEL_TARGET.length - 1, r)];
-    const nextTarget = LEVEL_TARGET[Math.min(LEVEL_TARGET.length - 1, r + 1)];
+    const target = levelTargetAt(m, r);
+    const nextTarget = levelTargetAt(m, r + 1);
     // early levels only once the board is full (units first); later a 6-unit core is enough
     const boardReady = ps.allChess().length >= (r <= 4 ? ps.deployCap : Math.min(ps.deployCap, 6));
     let want = price === 0;
@@ -2619,7 +2781,7 @@ function pagerRefreshes(m, ps) {
  */
 function plannedLevelFunds(m, ps) {
   const gd = ps.gd || m.gd;
-  const target = Math.min(LEVEL_TARGET[Math.min(LEVEL_TARGET.length - 1, m.round)], BOT_MAX_LEVEL, gd.maxShopLevel);
+  const target = Math.min(levelTargetAt(m, m.round), BOT_MAX_LEVEL, gd.maxShopLevel);
   let funds = 0;
   for (let level = ps.shop.level; level < target; level++) {
     funds += Math.max(0, level === ps.shop.level ? ps.shop.upgradePrice : gd.upgradeBase(level) ?? 0);
@@ -2813,7 +2975,9 @@ export function* buyLoopSteps(m, ps, { fillOnly = false, maxRefreshes = 0, polic
         // strategy bots) keeps its own equipment rule. §37.41: the elite items, the dolls and the bond item of a focus whose
         // top tier needs 缪尔赛思 are bought too (shopItemWanted).
         const wanted = !customPolicy && shopItemWanted(m, ps, s.id, ctx);
-        if (!customPolicy && !requested && !wanted && !ps.completesItemMerge(s.id)) return;
+        // ArkRunner local branch: cheap 规程 equipment (cheapItemWanted), at an ordinary card's priority
+        const cheap = !customPolicy && !wanted && cheapItemWanted(m, ps, s.id, ctx);
+        if (!customPolicy && !requested && !wanted && !cheap && !ps.completesItemMerge(s.id)) return;
         if (requested && !wanted && !ps.completesItemMerge(s.id) && !planItemRoom(m, ps, s)) return;
         if (customPolicy && (policy.canLevel(m, ps) || (canRefresh && freeSlot(ps.hand) >= 0
           && policy.searchTargets(m, ps).some(t => ps.funds >= refreshCost
@@ -2823,8 +2987,9 @@ export function* buyLoopSteps(m, ps, { fillOnly = false, maxRefreshes = 0, polic
         if (ps.funds - price < reserve && !ps.completesItemMerge(s.id)) return;
         const carriers = [...ps.board.values()].filter((p) => p.kind === 'chess' && slotFree(m, ps, p, gd.item(s.id))).length;
         if (!carriers && !requested) return;
-        sc = 6 + (gd.tierOf(s.id) || 1) * 3 - price + (ps.completesItemMerge(s.id) ? 10 : 0) + (requested ? 24 : 0) + (wanted ? WANTED_ITEM : 0);
-        if (wanted) wantedSlots.add(i);
+        sc = 6 + (gd.tierOf(s.id) || 1) * 3 - price + (ps.completesItemMerge(s.id) ? 10 : 0) + (requested ? 24 : 0) + (wanted ? WANTED_ITEM : 0)
+          + (cheap ? CHEAP_ITEM_BONUS : 0);
+        if (wanted || cheap) wantedSlots.add(i);
       }
       const merges = s.kind === 'chess' && ps.completesChessMerge(s.id)
         && (!customPolicy || policy.core(m, ps, s.id));
@@ -2866,6 +3031,8 @@ export function* buyLoopSteps(m, ps, { fillOnly = false, maxRefreshes = 0, polic
     // away (maybeFreeze keeps it for the next round)
     if (fillOnly && !customPolicy && pagerRefresh(m, ps)) continue;
     if (!customPolicy && pagerShowsMissing(m, ps)) return;
+    // ArkRunner local branch: a 规程 command that rerolls the shop is spent here, where nothing shown is worth buying
+    if (!customPolicy && commandShopStep(m, ps, ctx, { fillOnly, canRefresh, refreshCost, minPrice })) continue;
     if (canRefresh) {
       // Manual g.refresh cancels freezing and replaces its cards. §37.71: save an unaffordable explicit plan target first.
       if (ps.shop.slots.some(s => s && !s.sold && s.kind === 'chess'
@@ -2942,12 +3109,113 @@ export function* planSpendSteps(m, ps) {
  */
 const FA_LINEUPS = 2;
 function faLineups(m, ps, ctx, chosen) {
-  if (m.wave || m.round !== m.gd.bossRound) return [];
+  if (m.wave || !faAltRound(m)) return [];
   const gd = ps.gd || m.gd;
   const inSet = new Set(chosen.map((p) => p.uid));
   const bench = ps.allChess().filter((p) => !inSet.has(p.uid) && ps.find(p.uid)?.area !== 'board'
     && ((chessRec(m, p.id, ps)?.tier || 0) >= 4 || gd.isGolden(p.id)));
-  return benchSwaps(m, ps, ctx, chosen, bench).slice(0, FA_LINEUPS);
+  // (`faSwap`: never a copy in place of its own twin — the same lineup again, a wasted candidate: live R14 2026-11-23
+  // spent one of the two on 遥 for 遥)
+  return benchSwaps(m, ps, ctx, chosen, bench, (q) => q.id, expOn(m, 'faSwap')).slice(0, FA_LINEUPS);
+}
+
+/**
+ * The rounds whose leader field gets alternative lineups (faLineups, faDamageLineups): the Final Assault; with the
+ * ArkRunner local switch `faSwap` the Hidden Core too, which otherwise rehearsed layouts of the default lineup alone
+ * (live R15 snapshot 2026-11-23: three candidates, one lineup).
+ */
+function faAltRound(m) {
+  return m.round === m.gd.bossRound || (expOn(m, 'faSwap') && m.gd.hiddenRound != null && m.round === m.gd.hiddenRound);
+}
+
+/**
+ * ArkRunner local branch (opt-in `faSwap`) [ASSUMED]: battle-tested bench swaps on a leader field's rehearsed plan. The
+ * lineups the rehearsal compares all come from lineupScore (tier power — an elite ×1.9, so an elite 3-tier at 28.5 above
+ * a 6-tier at 25 —, bonds and roles; DPS from base stats only). On two live snapshots (2026-11-23 R14 Final Assault, R15
+ * Hidden Core) the chosen plan fielded 机械师★, 忍冬★ (two in R15) and 魔王 with no leader damage while 新约能天使, 遥,
+ * 缪尔赛思 and Mon3tr sat on the bench, and 新约能天使 entered no candidate. After the rehearsal, the FA_SWAP_OUTS deployed
+ * chess with the least leader damage in the chosen plan's battle × the FA_SWAP_INS strongest bench chess (tier, an elite
+ * one tier up; one per chess id) are tried — the incoming piece on the outgoing one's tile and facing, the outgoing one's
+ * summons off the plan — each in the same leader battle as the rehearsal (bossCandidateOpts, faRehearsalTicks, its
+ * seed); the best that beats the plan by FA_SWAP_GAIN of the rehearsal's value (leader damage × (1 − leaks /
+ * FA_LEAK_SECONDS), §37.61) is kept, FA_SWAP_PASSES times. Offline on those snapshots (native_stronghold probe_fixes.mjs):
+ * R14 61.9万 → 80.5万 in 22 battles, R15 48.6万 → 97.9万 in 27. Leader damage is credited by the hitting unit's uid (a
+ * piece's placed summons to their owner); a skill summon's may be missed, which only changes which pieces are tried.
+ * Returns { plan, chosen, log, lead } or null when nothing beat the plan.
+ */
+const FA_SWAP_OUTS = 3;
+const FA_SWAP_INS = 4;
+const FA_SWAP_PASSES = 2;
+const FA_SWAP_GAIN = 0.03;
+function faSwapPlan(m, ps, chosen, plan) {
+  if (!plan || !bossWaveOf(m, ps)) return null;
+  const gd = ps.gd || m.gd;
+  const byUid = new Map(chosen.map((p) => [p.uid, p]));
+  for (const p of ps.allChess()) if (!byUid.has(p.uid)) byUid.set(p.uid, p);
+  const cap = faRehearsalTicks(m);
+  const fight = (pl) => {
+    let opts;
+    try { opts = bossCandidateOpts(m, ps, byUid, pl); } catch { return null; }
+    if (!opts) return null;
+    let battle;
+    try { battle = m.newBattle(opts, { preview: true }); } catch { return null; }
+    const lead = new Map(), raw = new Map();
+    try {
+      battle.on('hpChanged', (c) => {
+        const u = c && c.credit;
+        if (!(c && c.delta < 0) || !c.target || !c.target.bossPool || c.target.side === 'ally' || !u || u.uid == null || u.ownerId !== ps.playerId) return;
+        raw.set(u.uid, (raw.get(u.uid) || 0) - c.delta);
+        const owner = byUid.get(u.uid)?.ownerUid ?? u.uid;
+        lead.set(owner, (lead.get(owner) || 0) - c.delta);
+      }, { priority: -2000, owner: 'bot-fa-swap' });
+    } catch { /* no counts: every deployed piece reads as 0 */ }
+    for (let t = 0; t < cap && !battle.finished; t++) battle.step();
+    const pp = battle.result().perPlayer?.[ps.playerId] || {};
+    const leaks = (pp.leaked || []).filter((l) => l.counted !== false).length;
+    const boss = Math.max(0, Number(pp.bossDamage) || 0);
+    return { value: boss * Math.max(0, 1 - leaks / FA_LEAK_SECONDS), lead, raw };
+  };
+  let ref = fight(plan);
+  if (!ref) return null;
+  const model = fieldModel(m, ps);
+  const strength = (p) => (chessRec(m, p.id, ps)?.tier || 0) + (gd.isGolden(p.id) ? 1 : 0);
+  let cur = plan;
+  const swaps = [...(plan.swaps || [])], log = [], added = [];
+  for (let pass = 0; pass < FA_SWAP_PASSES; pass++) {
+    const on = [...cur.keys()].map((u) => byUid.get(u)).filter((p) => p && p.kind === 'chess');
+    const outs = on.slice().sort((a, b) => (ref.lead.get(a.uid) || 0) - (ref.lead.get(b.uid) || 0) || a.uid - b.uid).slice(0, FA_SWAP_OUTS);
+    const ids = new Set();
+    const ins = ps.allChess().filter((p) => p.kind === 'chess' && !cur.has(p.uid) && !ids.has(p.id) && ids.add(p.id))
+      .sort((a, b) => strength(b) - strength(a) || effDps(model, rangeRec(ps, chessRec(m, b.id, ps))) - effDps(model, rangeRec(ps, chessRec(m, a.id, ps))) || a.uid - b.uid)
+      .slice(0, FA_SWAP_INS);
+    let top = null;
+    for (const o of outs) {
+      const key = cur.get(o.uid);
+      const [r, c] = parseKey(key);
+      for (const q of ins) {
+        if (gd.baseIdOf(q.id) === gd.baseIdOf(o.id) || !ps._legal(q, r, c)) continue;
+        const trial = new Map(cur);
+        trial.dirs = new Map(cur.dirs instanceof Map ? cur.dirs : []);
+        trial.delete(o.uid);
+        for (const u of [...trial.keys()]) if (byUid.get(u)?.ownerUid === o.uid) trial.delete(u);
+        trial.set(q.uid, key);
+        trial.dirs.set(q.uid, planDir(cur, o.uid));
+        const res = fight(trial);
+        if (res && (!top || res.value > top.res.value)) top = { res, trial, o, q };
+      }
+    }
+    if (!top || !(top.res.value > ref.value * (1 + FA_SWAP_GAIN))) break;
+    swaps.push([top.o.uid, top.q.uid]);
+    added.push(top.q);
+    log.push({ out: top.o.id, in: top.q.id, value: Math.round(top.res.value) });
+    cur = top.trial; ref = top.res;
+  }
+  if (cur === plan) return null;
+  // applyPlanSteps: another lineup (its members, the incoming pieces onto the replaced ones' tiles first)
+  cur.lineup = new Set(cur.keys());
+  cur.swaps = swaps;
+  const known = new Set(chosen.map((p) => p.uid));
+  return { plan: cur, chosen: [...chosen, ...added.filter((q) => !known.has(q.uid))], log, lead: ref.raw };
 }
 
 /**
@@ -3005,7 +3273,7 @@ function lineupDiffs(chosen, sets, sig = (set) => set.map((p) => p.uid).sort((a,
  */
 const FA_DAMAGE_WEIGHTS = Object.freeze([1, 3]);
 export function faDamageLineups(m, ps, chosen, ctx = context(m, ps)) {
-  if (m.wave || m.round !== m.gd.bossRound || !bossWaveOf(m, ps) || !ctx.model) return [];
+  if (m.wave || !faAltRound(m) || !bossWaveOf(m, ps) || !ctx.model) return [];
   return lineupDiffs(chosen, FA_DAMAGE_WEIGHTS.map((w) => chooseLineup(m, ps, { ...ctx, faDps: w }).set));
 }
 
@@ -3177,6 +3445,23 @@ export function* arrangeSteps(m, ps, { final = false, defer = false, delegate = 
     plans = [...base, ...fresh];
     more += fresh.length;
   }
+  // ArkRunner local branch (opt-in `aura`): against a walking leader with a damage area, the keep-away candidates of the
+  // default lineup and of each damage lineup, after every other candidate, which keep their places
+  if (final && boss && m.botRehearsal > 0 && plans.length && expOn(m, 'aura') && leaderAura(m, ps) > 0) {
+    const own = new Set(chosen.map((p) => p.uid));
+    for (const pl of plans) if (!pl.lineup) pl.lineup = own;
+    const known = new Set(rehChosen.map((p) => p.uid));
+    const add = [];
+    for (const pl of yield* leaderAuraPlansSteps(m, ps, chosen)) { pl.lineup = own; add.push(pl); }
+    for (const d of faDamageLineups(m, ps, chosen, ctx)) {
+      for (const pl of yield* leaderAuraPlansSteps(m, ps, d.set)) { pl.lineup = new Set(d.set.map((p) => p.uid)); pl.swaps = d.swaps; add.push(pl); }
+      for (const q of d.ins) if (!known.has(q.uid)) { known.add(q.uid); rehChosen = [...rehChosen, q]; }
+    }
+    const base = distinctPlans(plans).slice(0, Math.min(8, (adaptive ? 8 : m.botRehearsal) + extra) + more);
+    const fresh = distinctPlans([...base, ...add]).slice(base.length);
+    plans = [...base, ...fresh];
+    more += fresh.length;
+  }
   // §37.70 a normal round's candidate that feeds the 阿戈尔 devour a piece it knocks out also goes in devour-safe, after every
   // other candidate, which keep their places: the rehearsal takes the twin when it leaks less, else the original's layers;
   // §37.77 the Final Assault's feeding candidates, likewise after every other candidate: the most leader damage wins
@@ -3237,6 +3522,17 @@ export function positionTraitsOf(m, ps, c) {
     const bb = g.bb || {}, bs = g.bbStr || {};
     const before = out.length;
     if (g.effectKey === 'SERVER_ADD_BOND_POSITION') out.push({ kind: 'pos', off: bs.dir === 'behind' ? -1 : 1, n: numOr(bb.count) });
+    // ArkRunner local branch [ASSUMED], 规程 traits the parser did not place:
+    //   旅骨 (its own and the front operator's sale price in layers each prep end: 海沫's price grows) — posSell;
+    //   佩佩 (the operator behind gains layers as enemies around are stunned) — posBattle, half its per-battle cap;
+    //   凛御银灰 (the front 谢拉格 / 灵巧 operator's per-battle layer cap × 1.75) — cap;
+    //   阿米娅 (the front operator's layer gains + 1 each) — the existing `extra`.
+    else if (regOn(m, 'posReg') && g.effectKey === 'SERVER_ADD_BOND_POSITION_COUNT_SELL_PRICE') out.push({ kind: 'posSell', off: bs.dir === 'behind' ? -1 : 1, n: numOr(bb.multi, 1) });
+    else if (regOn(m, 'posReg') && g.eventType === 'IN_BATTLE' && bs.garrison_type === 'garrison_add_bond' && bs.bond_type === 'bond_allinrange' && /^b-/.test(String(bs.bond_range_id || '')))
+      out.push({ kind: 'posBattle', off: -1, n: 0.5 * numOr(bb.max_add_count_per_battle, 2 * numOr(bb.bond_add_count, 1)) });
+    else if (regOn(m, 'posReg') && bs.key === 'act3autochess_gar_effect_bondstackmax' && bs.range_id === '1-1') out.push({ kind: 'cap', bonds: bondList(bs.filter_bond_ids), n: numOr(bb.max_factor, 0.5) });
+    else if (regOn(m, 'posReg') && g.eventType === 'IN_BATTLE' && bs.give_garrison_id && gd.garrison(bs.give_garrison_id)?.bbStr?.key === 'act3autochess_gar_effect_ex_bond_cnt')
+      out.push({ kind: 'extra', n: numOr(gd.garrison(bs.give_garrison_id).bb?.extra_cnt, 1) });
     else if (g.effectKey === 'SERVER_ADD_BOND_METHOD' && bs.add_method === 'same_row') out.push({ kind: 'row', bonds: bondList(bs.bond), n: numOr(bb.multi, 1) });
     else if (bs.conditionkey === 'character_same_row') out.push({ kind: 'row3', need: numOr(bb.check_count, 3), g });
     else if (bs.bond_add_type === 'by_charcount_samerow') out.push({ kind: 'rowSkill', cap: numOr(bb.max_add_count_per_battle, 10), n: numOr(bb.bond_add_count_multi, numOr(bb.bond_add_count, 1)) });
@@ -3323,6 +3619,14 @@ function positionTraitValue(m, ps, view, W, p, key, dir, t, final) {
   const sum = (bonds, n) => bonds.reduce((s, b) => s + n * W(b), 0);
   switch (t.kind) {
     case 'pos': { const q = chessAhead(view, key, dir, t.off); return q ? sum(bondsOf(q), t.n) : 0; }
+    case 'posSell': { const q = chessAhead(view, key, dir, t.off); return q ? sum(bondsOf(q), t.n * (Number(ps.sellPriceOf(q)) || 1)) : 0; }
+    case 'posBattle': { const q = chessAhead(view, key, dir, t.off); return q ? sum(bondsOf(q), t.n) : 0; }
+    case 'cap': {
+      const q = front();
+      if (!q) return 0;
+      const c = chessRec(m, q.id, ps);
+      return bondsOf(q).filter((b) => (!t.bonds.length || t.bonds.includes(b)) && engineFor(m, c, b)).reduce((s, b) => s + 4 * t.n * W(b), 0);
+    }
     case 'row': return sum(t.bonds, t.n * rowChess(view, key));
     case 'row3': {
       if (rowChess(view, key) < t.need) return 0;
@@ -3762,6 +4066,71 @@ export function* leaderHoldPlansSteps(m, ps, chosen) {
 }
 
 /**
+ * ArkRunner local branch (opt-in `aura`). Walking leaders that hurt every operator around them all the time: enemy key →
+ * radius. 矩兽 (regulation-bosses.js kitBeast): 【尚同】 its ATK as physical damage within 1.6 tiles every 2.5 s, twice
+ * that while blocked; 90 % damage resistance while it walks, 35 % while held. In 1300 recorded 终极 matches it won 1 of
+ * 123: replays of its Final Assaults show it blocked 23 % of the time and the units beside its loop dead within 40 s
+ * (ATK 1509 against 1500–3600 HP).
+ */
+const WALK_AURA = Object.freeze({ enemy_2124_dyjsfg: 1.6 });
+const AURA_SAFE = 2;
+function leaderAura(m, ps) {
+  const g = bossWaveOf(m, ps);
+  const sp = g && Array.isArray(g.wave.spawns) ? g.wave.spawns.find((s) => s && s.tag === 'boss') : null;
+  return sp ? WALK_AURA[sp.enemyKey] || 0 : 0;
+}
+
+/**
+ * Candidates against such a leader: the lineup's blockers, the toughest first, alone on its route — every third (or
+ * second) melee tile from where it enters, so that the strike around one held blocker does not reach the next — and
+ * every other unit planned to cover those tiles from outside the area (Layout.value `aura`). Only candidates: the
+ * boss rehearsal keeps whichever deals the most.
+ */
+export function* leaderAuraPlansSteps(m, ps, chosen) {
+  const radius = m.wave || m.round !== m.gd.bossRound || !expOn(m, 'aura') ? 0 : leaderAura(m, ps);
+  if (!(radius > 0)) return [];
+  const pgd = ps.gd || m.gd;
+  const model = fieldModel(m, ps);
+  const lead = model.routes.find((rt) => !rt.fly && rt.lead);
+  if (!lead || lead.tiles.length < 2) return [];
+  const T = lead.tiles;
+  const deployMap = ps.deployMap();
+  const melee = new Set(legalTiles(deployMap, 'melee').map(([r, c]) => tileKey(r, c)));
+  const recs = new Map(chosen.map((p) => [p.uid, p.kind === 'chess' ? rangeRec(ps, pgd.chess(p.id)) : (p.kind === 'token' ? pgd.token(p.id) : null)]));
+  const classOf = (p) => (p.kind === 'chess' ? placeClass(ps, pgd.chess(p.id)) : positionClass(recs.get(p.uid)));
+  const tough = (p) => { const st = recs.get(p.uid)?.stats || {}; return (st.maxHp || 0) * (1 + (st.def || 0) / 500); };
+  const blockers = chosen.filter((p) => p.kind === 'chess' && isBlocker(recs.get(p.uid)) && classOf(p) !== 'ranged')
+    .sort((a, b) => tough(b) - tough(a) || a.uid - b.uid);
+  const order = [];
+  for (const k of T) if (melee.has(k) && !order.includes(k)) order.push(k);
+  if (!blockers.length || !order.length) return [];
+  const danger = new Set();
+  const all = [...legalTiles(deployMap, 'all')];
+  for (const k of new Set(T)) {
+    const [pr, pc] = parseKey(k);
+    for (const [r, c] of all) if ((r - pr) ** 2 + (c - pc) ** 2 <= radius ** 2 + 1e-9) danger.add(tileKey(r, c));
+  }
+  const facing = (key) => {
+    const i = T.indexOf(key), prev = T[Math.max(0, i - 1)];
+    const [r, c] = parseKey(key), [pr, pc] = parseKey(prev);
+    return pr > r ? 'UP' : pr < r ? 'DOWN' : pc < c ? 'LEFT' : 'RIGHT';
+  };
+  const out = [];
+  for (const gap of [3, 2]) {
+    const chain = order.filter((k, i) => i % gap === 0).slice(0, blockers.length);
+    const plan = new LayoutPlan();
+    blockers.slice(0, chain.length).forEach((p, i) => { plan.set(p.uid, chain[i]); plan.dirs.set(p.uid, facing(chain[i])); });
+    const hold = new Set(chain);
+    for (const k of chain) { const i = T.indexOf(k); if (i > 0) hold.add(T[i - 1]); }
+    const sub = yield* planLayoutSteps(m, ps, chosen.filter((p) => !plan.has(p.uid)),
+      { ...LAYOUT_PARAMS, roadPenalty: 0, body: FA_BODY_WEIGHT, holdTiles: hold, aura: danger, auraSafe: AURA_SAFE }, { occupied: new Set(chain) });
+    for (const [uid, key] of sub) { plan.set(uid, key); plan.dirs.set(uid, planDir(sub, uid)); }
+    out.push(plan);
+  }
+  return out;
+}
+
+/**
  * §37.33 [ASSUMED] One more boss-round candidate (round-54 Opus solo game, seed 1): the blockers on consecutive tiles
  * of the leader's route where it passes most (its loop), facing the way it comes, and every other unit re-aimed at
  * those tiles. A blocked 卢西恩 does not evade and every leader is held where the damage is. Only a candidate: the boss
@@ -4126,6 +4495,41 @@ function nineItem(m, ps, id, ctx) {
 const shopItemWanted = (m, ps, id, ctx) => eliteItem(m, ps, id) || dollItem(m, ps, id) || nineItem(m, ps, id, ctx) || lendItem(m, ps, id, ctx);
 
 /**
+ * ArkRunner local branch [ASSUMED]: cheap 规程 shop equipment that §37.39 left unbought. Bought like an ordinary card
+ * (CHEAP_ITEM_BONUS, no WANTED_ITEM priority), where the loop would otherwise refresh.
+ *   spread — with an operator deployed whose prep-end trait counts the deployed operators that carry equipment
+ *     (涤火杰西卡, SERVER_ADD_BOND_BOARD_EQUIP_CHAR: 2 layers each on 维多利亚 and 坚守 per carrier), or with 维多利亚 the
+ *     active focus (its members gain per item): worn equipment without a drawback of at most SPREAD_ITEM_PRICE while a
+ *     deployed operator carries none (season guides: 「没牌可抓时，每回合买便宜装备」);
+ *   layers — 随身身份牌 at 1 fund (consumed: 3 layers on each of the carrier's bonds, at least TRADE_MIN a fund once the
+ *     carrier has an active bond) from LAYER_ITEM_FROM, and 卫戍推荐信 (1 layer on the carrier's active bonds every prep
+ *     end) while LAYER_LETTER_ROUNDS rounds are left.
+ */
+const SPREAD_ITEM_PRICE = 2;
+const CHEAP_ITEM_BONUS = 5;
+const LAYER_ITEM_FROM = 4;
+const LAYER_LETTER_ROUNDS = 5;
+const ITEM_DRAWBACK_RE = /流失|无法被治疗|阻挡数-|生命上限-/;
+const countsCarriers = (m, ps) => [...ps.board.values()].some((p) => p.kind === 'chess'
+  && (chessRec(m, p.id, ps)?.garrisonIds || []).some((gid) => (ps.gd || m.gd).garrison(gid)?.effectKey === 'SERVER_ADD_BOND_BOARD_EQUIP_CHAR'));
+function cheapItemWanted(m, ps, id, ctx) {
+  const gd = ps.gd || m.gd, rec = gd.item(id);
+  if (!rec || rec.itemType !== 'EQUIP' || rec.isGolden) return false;
+  const key = itemEffect(rec), consumed = typeof rec.kind === 'string' && rec.kind.startsWith('consume_on_equip');
+  if (regOn(m, 'itemLayer') && m.round < gd.bossRound) {
+    const carrier = [...ps.board.values()].some((p) => p.kind === 'chess' && (chessRec(m, p.id, ps)?.bonds || []).some((b) => ps.bonds[b]?.active));
+    if (key === 'use_equip_bond_layer' && rec.price <= 1 && m.round >= LAYER_ITEM_FROM && carrier) return true;
+    if (key === 'prep_end_act_bond' && rec.price <= 2 && gd.bossRound - m.round >= LAYER_LETTER_ROUNDS && carrier) return true;
+  }
+  if (regOn(m, 'vicEquip') && !consumed && rec.price <= SPREAD_ITEM_PRICE && !ITEM_DRAWBACK_RE.test(String(rec.desc || ''))
+    && !rec.canGiveBond && m.round < gd.bossRound
+    && (countsCarriers(m, ps) || (ctx.focus === 'victoriaShip' && ps.bonds.victoriaShip?.active))) {
+    return [...ps.board.values()].some((p) => p.kind === 'chess' && !(p.items || []).length && slotFree(m, ps, p, rec));
+  }
+  return false;
+}
+
+/**
  * §37.44: the item tier up to which the strategy turns the focus bond's top tier into lending a skill-starting member's
  * equipment to its 8 neighbours (娜仁图亚's 6 萨尔贡: a bond buff with `valid_in_band` and `filter_item_level`), else 0.
  */
@@ -4294,6 +4698,17 @@ export function itemTarget(m, ps, item, ctx = context(m, ps), usePlan = true) {
       const dead = (p) => !sameTier && (counts.get(gd.baseIdOf(p.id)) || 0) >= 2 && !live(gd.baseIdOf(p.id));
       const pair = owned.filter((p) => normal(p) && !dead(p) && (counts.get(gd.baseIdOf(p.id)) || 0) + 1 >= mergeNeed(m, gd.baseIdOf(p.id)))
         .sort((a, b) => (chessRec(m, b.id, ps)?.tier || 0) - (chessRec(m, a.id, ps)?.tier || 0) || a.uid - b.uid);
+      // ArkRunner local branch (opt-in `holdMimic`, 规程 拟态物质 only): the item is a tier-5 card; worn on a tier-1 pair it
+      // buys a 2-fund copy (seen live 2026-11-23). It waits for a pair of tier >= ELITE_ITEM_TIER (the third copy) or a
+      // single of tier >= 5 (a random operator of that tier), and from the last normal prep on goes to the best target.
+      if (sameTier && expOn(m, 'holdMimic')) {
+        const tierOf = (p) => chessRec(m, p.id, ps)?.tier || 0;
+        const high = pair.find((p) => tierOf(p) >= ELITE_ITEM_TIER);
+        if (high) return high;
+        const single = owned.filter((p) => normal(p) && tierOf(p) >= 5).sort((a, b) => tierOf(b) - tierOf(a) || val(b) - val(a) || a.uid - b.uid)[0];
+        if (single) return single;
+        if (m.round < gd.bossRound - 1) return null;
+      }
       return pair[0] || owned.filter((p) => !dead(p)).sort((a, b) => rel(b) - rel(a) || val(b) - val(a) || a.uid - b.uid)[0] || null;
     }
     // 博士投影: the normal one promotes at the next round start, the golden one (缪尔赛思's R1 item, item merges) at once;
@@ -4361,6 +4776,12 @@ export function itemTarget(m, ps, item, ctx = context(m, ps), usePlan = true) {
   if (ctx.focus === 'victoriaShip' && ps.bonds.victoriaShip?.active && rec.category !== 'SURVIVAL') {
     const vic = (p) => (chessRec(m, p.id, ps)?.bonds || []).includes('victoriaShip');
     order = [...order.filter(vic), ...order.filter((p) => !vic(p))];
+  }
+  // ArkRunner local branch [ASSUMED]: with 涤火杰西卡's trait deployed every carrier counts once — an operator without
+  // equipment comes first
+  if (regOn(m, 'vicEquip') && countsCarriers(m, ps)) {
+    const bare = (p) => !(p.items || []).length;
+    order = [...order.filter(bare), ...order.filter((p) => !bare(p))];
   }
   return order.find(free) || null;
 }
@@ -4752,17 +5173,171 @@ export function createBotPrepSteps(actions = {}, policy = null) {
 
 const LEGACY_PREP = createBotPrepSteps();
 
+// ---------------------------------------------------------------------------------------------------
+// ArkRunner local branch (not upstream): 规程 command rules. Each rule has a switch — a name in `m.botOff` turns it
+// off — so a benchmark can pair a match with and without it (stronghold-training/tools/botlab.mjs --off).
+const regOn = (m, name) => !(m.botOff && m.botOff.has(name));
+/** Rules still being measured: on only when the match names them in `m.botOn` (botlab.mjs --on). */
+const expOn = (m, name) => !!(m.botOn && m.botOn.has(name));
+/** The rounds from which a once-per-match command stops waiting for a better target. */
+const HOLD_RELAX = 8;
+const HOLD_LAST = 10;
+/** A falling-price command (焰尾, 怒潮凛冬) and a rising one (车尔尼) buy one operator: not above this price. */
+const COMMAND_PRICE_CAP = 2;
+const COMMAND_RISING_CAP = 3;
+
+/**
+ * [ASSUMED] Once-per-match commands wait for a target worth them (the legacy rule spent them in the first prep on a
+ * 1阶 operator; upstream §37.42 measured the same mistake on 缪尔赛思's 博士投影). undefined: not such a command;
+ * false: wait; else the target.
+ *   缪尔赛思 (promote at once): the highest-tier deployed normal operator that is not one of a merge pair — a 4阶 or
+ *     higher at once, a 3阶 from HOLD_RELAX, anyone from HOLD_LAST;
+ *   夕 (copy with elite state and equipment): a deployed elite of 4阶 or higher at once, any elite or a 5阶 from
+ *     HOLD_RELAX, the best deployed operator from HOLD_LAST;
+ *   渡桥 (one refresh of copies of the deployed operators): with 5 operators deployed at shop level 4 and funds to buy
+ *     two of them, or from HOLD_LAST + 1 with any funds left.
+ */
+function heldCommandTarget(m, ps, keys, view, ctx) {
+  const gd = ps.gd || m.gd;
+  const deployed = new Set([...ps.board.values()].filter((p) => p.kind === 'chess').map((p) => p.uid));
+  const pieces = () => view.targets.map((t) => ps.find(t.uid)?.piece).filter(Boolean);
+  const tier = (p) => gd.tierOf(p.id) || 0;
+  const dealer = (p) => { const c = chessRec(m, p.id, ps); return c && !isHealer(c) && c.attackKind !== 'none' ? 1 : 0; };
+  if (keys.has('skill_upgrade_char')) {
+    const single = (p) => ((ctx.copies.get(gd.baseIdOf(p.id)) || 0) < 2 ? 1 : 0);
+    const best = pieces().filter((p) => deployed.has(p.uid)).sort((a, b) => single(b) - single(a) || tier(b) - tier(a)
+      || dealer(b) - dealer(a) || pieceValue(m, ps, b, ctx) - pieceValue(m, ps, a, ctx) || a.uid - b.uid)[0];
+    if (!best) return m.round >= HOLD_LAST ? undefined : false;
+    const need = m.round >= HOLD_LAST ? 0 : m.round >= HOLD_RELAX ? 3 : 4;
+    return tier(best) >= need ? { uid: best.uid } : false;
+  }
+  if (keys.has('skill_copy_char_with_equip')) {
+    const elite = (p) => (gd.isGolden(p.id) ? 1 : 0);
+    const best = pieces().filter((p) => deployed.has(p.uid)).sort((a, b) => elite(b) - elite(a) || tier(b) - tier(a)
+      || (b.items?.length || 0) - (a.items?.length || 0) || dealer(b) - dealer(a) || a.uid - b.uid)[0];
+    if (!best) return m.round >= HOLD_LAST ? undefined : false;
+    if (m.round >= HOLD_LAST || (elite(best) && tier(best) >= 4)) return { uid: best.uid };
+    return m.round >= HOLD_RELAX && (elite(best) || tier(best) >= 5) ? { uid: best.uid } : false;
+  }
+  if (keys.has('skill_refresh_shop_board_char')) {
+    const spare = ps.funds - view.currentCost;
+    if (m.round > HOLD_LAST) return spare >= 1 ? view.targets[0] : false;
+    return deployed.size >= 5 && ps.shop.level >= 4 && spare >= 6 ? view.targets[0] : false;
+  }
+  return undefined;
+}
+
+/**
+ * [ASSUMED] Targets the legacy rule picked by tier alone. undefined: no rule; false: nothing worth it this prep.
+ *   昆图斯 (a random operator one tier higher, each prep): cellTarget's order (§37.45) — the highest tier below 6阶
+ *     outside the focus bond, never an elite or one of a merge pair;
+ *   但书 (+9 layers on the target's active bonds): the deployed operator whose active bonds matter most;
+ *   三船光平 (sells the target, its tier in layers on every active bond): the highest-tier bench operator that is
+ *     neither kept, a pair, an elite nor a carrier — a sale the bench budget makes anyway, with layers on top.
+ */
+function ruledCommandTarget(m, ps, keys, view, ctx) {
+  const gd = ps.gd || m.gd;
+  const pieces = () => view.targets.map((t) => ps.find(t.uid)?.piece).filter(Boolean);
+  const tier = (p) => gd.tierOf(p.id) || 0;
+  const copies = (p) => ctx.copies.get(gd.baseIdOf(p.id)) || 0;
+  if (keys.has('skill_transform_char_up_tier')) {
+    let best = null, bestV = Infinity;
+    for (const p of pieces()) {
+      if (gd.isGolden(p.id) || tier(p) >= 6 || copies(p) >= 2) continue;
+      const member = !!ctx.focus && (chessRec(m, p.id, ps)?.bonds || []).includes(ctx.focus);
+      const v = (member ? 1000 : 0) - 100 * tier(p) + (p.items?.length || 0) * 10 + pieceValue(m, ps, p, ctx) * 0.01;
+      if (v < bestV || (v === bestV && p.uid < best.uid)) { bestV = v; best = p; }
+    }
+    return best ? { uid: best.uid } : false;
+  }
+  if (keys.has('skill_act_bond_grow_garr_cnt')) {
+    const rel = (p) => (chessRec(m, p.id, ps)?.bonds || []).reduce((s, b) => s + (!ps.bonds[b]?.active ? 0 : b === ctx.focus ? 3 : b === ctx.second ? 2 : 1), 0);
+    const onBoard = new Set([...ps.board.values()].map((p) => p.uid));
+    const best = pieces().sort((a, b) => rel(b) - rel(a) || Number(onBoard.has(b.uid)) - Number(onBoard.has(a.uid)) || a.uid - b.uid)[0];
+    return best && rel(best) > 0 ? { uid: best.uid } : false;
+  }
+  if (keys.has('skill_sell_char_bond_layer')) {
+    if (!Object.values(ps.bonds).some((b) => b.active)) return false;
+    const bench = new Set(ps.hand.filter(Boolean).map((p) => p.uid));
+    const best = pieces().filter((p) => bench.has(p.uid) && !gd.isGolden(p.id) && copies(p) < 2 && !(p.items || []).length
+      && !ctx.keep.has(gd.baseIdOf(p.id)) && !pagerKeeps(m, ps, p) && !planProtected(m, ps, p) && !unseen(ps, p))
+      .sort((a, b) => tier(b) - tier(a) || pieceValue(m, ps, a, ctx) - pieceValue(m, ps, b, ctx) || a.uid - b.uid)[0];
+    return best ? { uid: best.uid } : false;
+  }
+  return undefined;
+}
+
+/** Commands that reroll shop cards: the buy loop spends them (commandShopStep), not the prep's first step. */
+const SHOP_COMMAND_KEYS = Object.freeze(['skill_transform_char_same_tier', 'skill_refresh_shop_high_tier', 'skill_refresh_shop_bond_char']);
+
+/**
+ * [ASSUMED] One use of a shop command inside the buy loop, at the point where the legacy loop would refresh or stop
+ * (nothing shown is worth its price). The legacy rule used each once, in the prep's first step, on the first card.
+ *   风丸 (a shop operator becomes a random one of its tier, free, twice a prep): the highest-tier operator shown;
+ *   雅拉 (a refresh with one operator a tier above the shop level, three a prep): in place of a paid refresh that
+ *     costs as much, while funds remain to buy that operator;
+ *   杜遥夜 (a refresh with a member of its bond, two a prep): likewise, and before the level-up while that bond is
+ *     the focus.
+ * A command refresh is not a manual refresh (bandCommandEffects): refresh traits do not fire, the frozen flag stays.
+ */
+function commandShopStep(m, ps, ctx, { fillOnly, canRefresh, refreshCost, minPrice }) {
+  if (!ps.command || !regOn(m, 'cmdShop')) return false;
+  const skill = commandSkill(ps), view = commandView(ps);
+  if (!skill || !view?.usable || !view.targets.length) return false;
+  const gd = ps.gd || m.gd;
+  if (freeSlot(ps.hand) < 0) return false;
+  for (const b of skill.buffs) {
+    if (b.key === 'skill_transform_char_same_tier') {
+      const t = [...view.targets].sort((x, y) => (gd.tierOf(ps.shop.slots[y.slot].id) || 0) - (gd.tierOf(ps.shop.slots[x.slot].id) || 0) || x.slot - y.slot)[0];
+      return !!t && ps.funds >= minPrice && !!ps.useCommand(view.effectId, t).ok;
+    }
+    if (b.key === 'skill_refresh_shop_high_tier') {
+      const want = Math.min(6, ps.shop.level + 1);
+      if (fillOnly || view.currentCost > Math.max(1, refreshCost) || ps.funds < view.currentCost + (canRefresh ? minPrice : want)) return false;
+      return !!ps.useCommand(view.effectId, view.targets[0]).ok;
+    }
+    if (b.key === 'skill_refresh_shop_bond_char') {
+      const bond = { ...b.bb, ...b.bbStr }.bond;
+      const forFocus = !!bond && ctx.focus === bond;
+      if (!(forFocus || (canRefresh && !fillOnly)) || view.currentCost > Math.max(1, refreshCost) || ps.funds < view.currentCost + minPrice) return false;
+      return !!ps.useCommand(view.effectId, view.targets[0]).ok;
+    }
+  }
+  return false;
+}
+
 /** Bounded command decisions: economy before shopping, battle marks after the lineup. No default-season RNG draws. */
 export function botUseCommand(m, ps, battleMarks = false) {
   const skill = commandSkill(ps), view = commandView(ps);
   if (!view?.usable || !view.targets.length) return false;
   const keys = new Set(skill.buffs.map(b => b.key));
-  const mark = ['skill_mark_char_inst_tag', 'skill_mark_pos_grow_use_cnt', 'skill_add_pos_effect_enemy',
+  if (regOn(m, 'cmdShop') && SHOP_COMMAND_KEYS.some(k => keys.has(k))) return false;
+  // 三船光平's sale follows the lineup: only then is the bench known and are the bonds it feeds active
+  const sells = keys.has('skill_sell_char_bond_layer') && regOn(m, 'cmdSell');
+  const mark = sells || ['skill_mark_char_inst_tag', 'skill_mark_pos_grow_use_cnt', 'skill_add_pos_effect_enemy',
     'skill_mark_shop_equip_tag', 'skill_layer_limit_grow_round', 'skill_garr_event_extra_exec'].some(k => keys.has(k));
   if (mark !== battleMarks) return false;
   // [ASSUMED] Avoid irreversible health/sale commands and paying for shop equipment the bot cannot buy this prep.
-  if (keys.has('skill_drop_hp_to_low_gain_coin') || keys.has('skill_sell_char_bond_layer')) return false;
+  if (keys.has('skill_drop_hp_to_low_gain_coin') || (keys.has('skill_sell_char_bond_layer') && !sells)) return false;
   if (keys.has('skill_next_equip_buy_discount') && ps.funds < view.currentCost + 1) return false;
+  if (regOn(m, 'cmdPrice') && keys.has('skill_gain_bond_char')) {
+    const falling = keys.has('skill_cost_round_grow_reset_on_use') || keys.has('skill_cost_reduce_on_buy_bond');
+    if (falling && view.currentCost > COMMAND_PRICE_CAP) return false;
+    if (keys.has('skill_cost_grow_per_use') && view.currentCost > COMMAND_RISING_CAP) return false;
+  }
+  let ctx = null;
+  const context0 = () => ctx || (ctx = context(m, ps));
+  if (regOn(m, 'cmdHold') && ['skill_upgrade_char', 'skill_copy_char_with_equip', 'skill_refresh_shop_board_char'].some(k => keys.has(k))) {
+    const held = heldCommandTarget(m, ps, keys, view, context0());
+    if (held === false) return false;
+    if (held) return !!ps.useCommand(view.effectId, held).ok;
+  }
+  if (['skill_transform_char_up_tier', 'skill_act_bond_grow_garr_cnt', 'skill_sell_char_bond_layer'].some(k => keys.has(k))
+    && (sells || regOn(m, 'cmdTarget'))) {
+    const ruled = ruledCommandTarget(m, ps, keys, view, context0());
+    if (ruled === false) return false;
+    if (ruled) return !!ps.useCommand(view.effectId, ruled).ok;
+  }
   let target = view.targets[0];
   if (view.targetType === 'COMMON_CHESS') {
     const transform = keys.has('skill_transform_char_up_tier') || keys.has('skill_remove_gain_bond_char');

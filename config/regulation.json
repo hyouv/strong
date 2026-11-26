@@ -4,7 +4,8 @@
   "version": "act3autochess@V3_1",
   "source": {
     "repository": "https://github.com/sganggs/Stronghold-Protocol",
-    "revision": "55f528e9fc4872388360ee85e13eca8594856204"
+    "revision": "55f528e9fc4872388360ee85e13eca8594856204",
+    "calibration_id": "stronghold-calibrated-engine-20261126"
   },
   "out_of_match": {
     "ownership": "all_available_operators",

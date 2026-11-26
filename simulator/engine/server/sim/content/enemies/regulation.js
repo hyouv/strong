@@ -108,6 +108,33 @@ function kitLtnclr(ab) {
   }];
 }
 
+/** 圆号手: attackTwoTarget (spCost 2 = every 3rd attack, nthOf) hits a second target as well (PRTS「攻击2次后，下一次攻击额外
+ *  攻击一个目标」). Its 激昂 / 沉郁 forms (attackTwoTarget_enthu, switchMode) follow the act29side field state, which no 卫戍
+ *  stage has: left out, as for 管乐家. Added 2026-11-24 (live calibration: 终极 R11 巫王乐团 15/15 escaped in the game). */
+function kitLtnhor(ab) {
+  const n = nthOf(ab.sk.attackTwoTarget);
+  return [{
+    sil: true,
+    before(c, b, e, a) { a.n = (a.n ?? 0) + 1; e.profile.maxTargets = a.n % n === 0 ? 2 : 1; },
+  }];
+}
+
+/** 鼓手: aoeAttack (spCost 2 = every 3rd attack) also hits every operator around its target (BOOM_RADIUS) at full ATK, a
+ *  splash of the attack's own damage type (PRTS「攻击2次后，下一次攻击对攻击范围内所有目标造成溅射伤害」). The 激昂 range growth
+ *  (aoeAttack_enthu) needs the act29side field state: left out. Added 2026-11-24 with 圆号手. */
+function kitLtndru(ab) {
+  const n = nthOf(ab.sk.aoeAttack);
+  return [{
+    sil: true,
+    before(c, b, e, a) { a.n = (a.n ?? 0) + 1; a.splash = a.n % n === 0; },
+    hitOut(c, b, e, a) {
+      const t = c.target;
+      if (!a.splash || !c.dmg || !c.dmg.isAttack || !t) return;
+      for (const u of areaAllies(b, e, t.x, t.y, BOOM_RADIUS)) if (u !== t) hurt(b, e, u, e.s.atk, c.dmg.type, { tags: ['splash'] });
+    },
+  }];
+}
+
 /** “投石机”: the first attack is ×scale, then it only melee-attacks. The handbook cross has no radius. */
 function kitWingnt(ab) {
   const scale = tv(ab, 'FirstAttack.attack@first_atk_scale', 1.5);
@@ -532,6 +559,10 @@ export const REGULATION_KITS = Object.freeze({
   enemy_1406_chghmr: kitChghmr,
   enemy_1375_ltnclr: kitLtnclr,
   enemy_1375_ltnclr_2: same(kitLtnclr),
+  enemy_1373_ltnhor: kitLtnhor,
+  enemy_1373_ltnhor_2: same(kitLtnhor),
+  enemy_1376_ltndru: kitLtndru,
+  enemy_1376_ltndru_2: same(kitLtndru),
   enemy_1388_wingnt: kitWingnt,
   enemy_1388_wingnt_2: same(kitWingnt),
   enemy_1191_krgrg: kitKrgrg,

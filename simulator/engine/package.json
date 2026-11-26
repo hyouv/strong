@@ -4,9 +4,22 @@
   "private": true,
   "type": "module",
   "license": "GPL-3.0-or-later",
-  "description": "Headless Stronghold Protocol (act3autochess@V3_1) core simulation engine extracted from sganggs/Stronghold-Protocol",
+  "description": "Headless Regulation engine with locally observed enemy scales and local battle/bot fixes",
   "upstream": {
     "repository": "https://github.com/sganggs/Stronghold-Protocol",
     "revision": "55f528e9fc4872388360ee85e13eca8594856204"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "calibration": {
+    "id": "stronghold-calibrated-engine-20261126",
+    "observed_on": [
+      "2026-11-23",
+      "2026-11-24"
+    ],
+    "packaged_on": "2026-11-26",
+    "source_tree": "reference_dev",
+    "local_changes_included": true
   }
 }

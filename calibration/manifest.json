@@ -1,0 +1,168 @@
+{
+  "package_id": "stronghold-calibrated-engine-20261126",
+  "game_version": "act3autochess@V3_1",
+  "upstream": {
+    "repository": "https://github.com/sganggs/Stronghold-Protocol",
+    "revision": "55f528e9fc4872388360ee85e13eca8594856204"
+  },
+  "strong_revision": "2d10e994b5cc00181d06f9f09f9107b67c5d342c",
+  "calibrated_rounds": {
+    "mode_multi_funny": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "mode_multi_hard": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "mode_multi_abyss": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ]
+  },
+  "observed_round_count": 43,
+  "modified_upstream_files": [
+    "data/versions/act3autochess-v3_1/config.json",
+    "server/match/bot.js",
+    "server/match/gamedata.js",
+    "server/match/waves.js",
+    "server/sim/battle/spawns.js",
+    "server/sim/content/enemies/regulation.js",
+    "server/sim/rehearsal.js",
+    "tools/build-data.mjs"
+  ],
+  "checkpoint": {
+    "name": "ppo_5m_solo_t2_best.pt",
+    "update": 220,
+    "parameters": 5079513
+  },
+  "four_seat_evaluation": [
+    {
+      "mode": "mode_multi_hard",
+      "seed": 1000000,
+      "victory": false,
+      "failed_round": 13,
+      "rounds_passed": 12,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        10,
+        7,
+        4,
+        12
+      ],
+      "rejected_actions": 10
+    },
+    {
+      "mode": "mode_multi_hard",
+      "seed": 1000001,
+      "victory": false,
+      "failed_round": 14,
+      "rounds_passed": 13,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        15,
+        21,
+        12,
+        22
+      ],
+      "rejected_actions": 13
+    },
+    {
+      "mode": "mode_multi_hard",
+      "seed": 1000002,
+      "victory": false,
+      "failed_round": 13,
+      "rounds_passed": 12,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        3,
+        5,
+        8,
+        16
+      ],
+      "rejected_actions": 0
+    },
+    {
+      "mode": "mode_multi_abyss",
+      "seed": 1000000,
+      "victory": false,
+      "failed_round": 12,
+      "rounds_passed": 11,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        13,
+        14,
+        7,
+        13
+      ],
+      "rejected_actions": 10
+    },
+    {
+      "mode": "mode_multi_abyss",
+      "seed": 1000001,
+      "victory": false,
+      "failed_round": 11,
+      "rounds_passed": 10,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        11,
+        8,
+        15,
+        19
+      ],
+      "rejected_actions": 10
+    },
+    {
+      "mode": "mode_multi_abyss",
+      "seed": 1000002,
+      "victory": false,
+      "failed_round": 9,
+      "rounds_passed": 8,
+      "simulator_errors": 0,
+      "cycle_breaks_by_seat": [
+        2,
+        5,
+        4,
+        10
+      ],
+      "rejected_actions": 0
+    }
+  ]
+}

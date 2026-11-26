@@ -1,0 +1,341 @@
+{
+ "_source": "Official client, read-only bridge (native_stronghold): sceneStateData.globalBattleEffects of every prep, the aceffect_enemy_* ids per round. Matches: co-op 标准 2026-11-23 (2), 绝境 2026-11-23 (1), 终极 2026-11-24 (3). The list was identical in every match of a mode (终极: 14/14 rounds across 3 matches).",
+ "_use": "tools/build-data.mjs buildConfig: a mode/round listed here takes its enemyScale from these effects (season effectBuffInfoDataDict values) instead of the research stack table (enemyScaleFor).",
+ "modes": {
+  "mode_multi_funny": {
+   "1": [
+    "aceffect_enemy_4"
+   ],
+   "2": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "3": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "4": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "5": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "6": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "7": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "8": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "9": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "10": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "11": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_4"
+   ],
+   "12": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_3",
+    "aceffect_enemy_4"
+   ],
+   "13": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_3",
+    "aceffect_enemy_4"
+   ],
+   "14": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_2",
+    "aceffect_enemy_3",
+    "aceffect_enemy_4"
+   ]
+  },
+  "mode_multi_hard": {
+   "1": [
+    "aceffect_enemy_7"
+   ],
+   "2": [
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "3": [
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "4": [
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "5": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "6": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "7": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "8": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "9": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "10": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "11": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "12": [
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_3",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "13": [
+    "aceffect_enemy_21",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_3",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "14": [
+    "aceffect_enemy_21",
+    "aceffect_enemy_21",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_3",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ],
+   "15": [
+    "aceffect_enemy_2",
+    "aceffect_enemy_21",
+    "aceffect_enemy_21",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_3",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7"
+   ]
+  },
+  "mode_multi_abyss": {
+   "1": [
+    "aceffect_enemy_8"
+   ],
+   "2": [
+    "aceffect_enemy_6",
+    "aceffect_enemy_8"
+   ],
+   "3": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_6",
+    "aceffect_enemy_8"
+   ],
+   "4": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8"
+   ],
+   "5": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8"
+   ],
+   "6": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8"
+   ],
+   "7": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8"
+   ],
+   "8": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "9": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "10": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "11": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "12": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_10",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "13": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_10",
+    "aceffect_enemy_15",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ],
+   "14": [
+    "aceffect_enemy_1",
+    "aceffect_enemy_10",
+    "aceffect_enemy_15",
+    "aceffect_enemy_16",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_2_2",
+    "aceffect_enemy_6",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_7",
+    "aceffect_enemy_8",
+    "aceffect_enemy_8",
+    "aceffect_enemy_9"
+   ]
+  }
+ }
+}

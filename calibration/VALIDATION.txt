@@ -1,0 +1,13 @@
+验证日期 2026-11-26
+包标识 stronghold-calibrated-engine-20261126
+
+检查在独立临时目录进行，将此 ZIP 解压到 STRONG 2d10e994b5cc00181d06f9f09f9107b67c5d342c 的完整源码副本。
+环境为 Windows、Node.js v26.13.0、Python 3.10 和 PyTorch 2.5.1+cu121。
+
+1. ZIP CRC 检查通过。543 个原版布局中的源码／数据／许可文件逐字节匹配本地 reference_dev。package.json 另包含校准版本元数据，另附 THIRD-PARTY-NOTICES.md。
+2. 本地引擎补丁与前一轮六局四席评测保存的补丁一致。
+3. node verify_calibration.mjs 通过。读取到 43 个实测模式／回合组合。绝境 R14 hpMul=9.52542，终极 R14 hpMul=12.280707、aspdAdd=30。
+4. node --test tests/test_js_simulator.mjs 通过，7 tests，7 pass，0 fail。包含协议版本校验、完整四席对局、合法动作、指令状态和机器人示范生成。
+5. tests/test_rl_pipeline.py 中的 test_bc_cold_start_and_masked_ppo_smoke 通过。通过 runpy 调用该现有测试，使用独立临时输出目录。覆盖 4 局示范采集、4 轮小模型 BC、checkpoint 保存／加载、实时评估、2 局 PPO 采样、价值头预热与完整 PPO 更新。
+
+六局高难度四席评估摘要见 manifest.json。

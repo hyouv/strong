@@ -49,6 +49,32 @@ export class RehearsalScore {
     this.boss = -Infinity;
     this.gain = -Infinity;
     this.score = -Infinity;
+    /**
+     * ArkRunner local branch (bot.js opt-in `faLp`): the team's LP when a boss field's rehearsal starts. When set, the
+     * field's candidates are ranked by leader damage per second × the seconds the fight would last (`faSeconds`).
+     */
+    this.lp = null;
+    this.value = null;
+    /**
+     * ArkRunner local branch (bot.js opt-in `tieUseful`): on a tie of leaks, leader damage and layer gains, more of the
+     * player's operators that dealt damage or healed win, then the earlier clear. Every candidate of an easy normal field
+     * ties at 0 leaks, and the earliest one kept an operator parked where it reaches no enemy (live 2026-11-23, 忍冬).
+     */
+    this.tieUseful = false;
+    this.useful = -1;
+    this.time = Infinity;
+  }
+
+  /**
+   * ArkRunner local branch. Seconds a boss field lasts when it goes on losing LP the way the rehearsal did: `loss` LP in
+   * `secs` seconds — counted leaks and the leader's own 扣除目标生命 (result.lpLoss: 后兽 takes 1 LP for every escort
+   * that touches it, which is no counted leak) — and 1 LP a second after the 150 s grace (finalAssault.js overtime).
+   * Before, only counted leaks cost anything (× 1/150 each): against 矩兽 the fields of 1300 recorded matches ended
+   * after 30–80 s with the team's LP eaten by 后兽 while the rehearsal had ranked those layouts by damage alone.
+   */
+  faSeconds(loss, secs) {
+    const lp = Math.max(1, this.lp), l = Math.max(0, loss) / Math.max(1, secs);
+    return l * 150 >= lp ? lp / l : 150 + (lp - 150 * l) / (1 + l);
   }
 
   /**
@@ -79,6 +105,19 @@ export class RehearsalScore {
     const score = -leaks * 1000 + (pp.killed || 0) - candidateIndex * 0.01;
     // §37.37: the layers the battle gained (its 特质 and bonds, `layerGains`) break a leak and leader-damage tie
     const gain = Object.values(pp.layerGains || {}).reduce((s, n) => s + (Number(n) || 0), 0);
+    const useful = this.tieUseful ? (pp.unitStats || []).filter((u) => u && (u.kind === 'op' || u.kind === 'token') && ((u.dmg || 0) > 0 || (u.heal || 0) > 0)).length : -1;
+    const time = this.tieUseful && r.reason === 'cleared' ? Number(r.time) || Infinity : Infinity;
+    if (bossField(battle) && this.lp != null) {
+      const value = boss * this.faSeconds(leaks + (Number(r.lpLoss) || 0), Number(r.time) || 65);
+      if (this.value != null && !(value > this.value + 1e-6)) return false;
+      this.value = value;
+      this.score = score;
+      this.leaks = leaks;
+      this.boss = boss;
+      this.gain = gain;
+      this.index = candidateIndex;
+      return true;
+    }
     if (bossField(battle) && this.leaks < Infinity && (boss > 0 || this.boss > 0)) {
       const value = boss * Math.max(0, 1 - leaks / FA_LEAK_SECONDS), best = this.boss * Math.max(0, 1 - this.leaks / FA_LEAK_SECONDS);
       if (Math.abs(value - best) > 1e-6) {
@@ -91,11 +130,16 @@ export class RehearsalScore {
         return true;
       }
     }
+    const tied = leaks === this.leaks && boss === this.boss && gain === this.gain;
     const better = leaks < this.leaks
       || (leaks === this.leaks && boss > this.boss)
       || (leaks === this.leaks && boss === this.boss && gain > this.gain)
-      || (leaks === this.leaks && boss === this.boss && gain === this.gain && score > this.score);
+      || (tied && this.tieUseful && useful !== this.useful ? useful > this.useful
+        : tied && this.tieUseful && time !== this.time ? time < this.time
+          : tied && score > this.score);
     if (!better) return false;
+    this.useful = useful;
+    this.time = time;
     this.score = score;
     this.leaks = leaks;
     this.boss = boss;

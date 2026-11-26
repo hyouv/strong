@@ -456,11 +456,14 @@ export class GameData {
     const e = this.mode.enemyScale && this.mode.enemyScale[String(r)];
     if (!e || typeof e !== 'object') return { hpMul: 1, atkMul: 1, speedMul: 1 };
     const supply = numOr(e.supplyHp, 1);
+    const aspd = numOr(e.aspd, 0);
     return {
       hpMul: Math.max(0.01, numOr(e.hp, 1)),
       atkMul: Math.max(0, numOr(e.atk, 1)),
       speedMul: Math.max(0.01, numOr(e.speed, 1)),
       ...(supply > 0 && supply !== 1 ? { supplyHpMul: supply } : {}),
+      // the round's attack-speed adds (攻坚装备 enemy_attribute_add, observed rounds of config.json)
+      ...(aspd !== 0 ? { aspdAdd: aspd } : {}),
     };
   }
 

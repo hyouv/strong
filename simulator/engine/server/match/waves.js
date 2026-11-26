@@ -260,6 +260,8 @@ export function scaleFor(gd, r) {
 export function roundMods(scale) {
   const m = { hpMul: scale.hpMul, atkMul: scale.atkMul, speedMul: scale.speedMul };
   if (scale.supplyHpMul != null) m.supplyHpMul = scale.supplyHpMul;
+  // the round's 攻坚装备 attack-speed adds (activity_table enemy_attribute_add attack_speed), when the scale names them
+  if (Number.isFinite(scale.aspdAdd) && scale.aspdAdd !== 0) m.aspdAdd = scale.aspdAdd;
   return m;
 }
 
