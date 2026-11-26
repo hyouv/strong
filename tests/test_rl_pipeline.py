@@ -127,6 +127,10 @@ def test_solo_mode_codec_bijection_and_logprob_consistency() -> None:
             assert abs(float(out["log_prob"].item()) - act["log_prob"]) < 1e-4
             assert abs(float(out["value"].item()) - act["value"]) < 1e-4
             assert abs(float(out["entropy"].item()) - act["entropy"]) < 1e-4
+            sub_ent_sum = float(
+                (out["type_ent"] + out["src_ent"] + out["band_ent"] + out["tgt_ent"] + out["opt_ent"]).item()
+            )
+            assert abs(sub_ent_sum - act["entropy"]) < 1e-5
             checked_frames += 1
 
     assert checked_frames >= 10
@@ -379,6 +383,7 @@ def test_curriculum_modes_round_discount_and_tier2_codec() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
     u_stats = ppo_update(model, opt, rollout, cfg=ppo_cfg)
     assert u_stats["strategic_entropy"] >= 0.0
+    assert 0.0 <= u_stats["explore_entropy"] <= u_stats["entropy"] * ppo_cfg.strategic_ent_mult + 1e-4
     assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())
 
     # Verify merge_bc_datasets keeps primary tail intact

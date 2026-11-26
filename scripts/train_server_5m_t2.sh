@@ -70,10 +70,10 @@ PPO_EPISODES_PER_UPDATE="${PPO_EPISODES_PER_UPDATE:-120}"
 PPO_WORKERS="${PPO_WORKERS:-60}"
 PPO_MIN_BATCH="${PPO_MIN_BATCH:-24}"
 PPO_BATCH_TIMEOUT_MS="${PPO_BATCH_TIMEOUT_MS:-2.0}"
-PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-512}"
+PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-1024}"
 PPO_CRITIC_WARMUP="${PPO_CRITIC_WARMUP:-4}"
-PPO_LR="${PPO_LR:-5e-5}"
-PPO_LR_END="${PPO_LR_END:-5e-6}"
+PPO_LR="${PPO_LR:-3e-5}"
+PPO_LR_END="${PPO_LR_END:-3e-6}"
 PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-2}"
 
@@ -84,11 +84,16 @@ PPO_MIX_RATIO_END="${PPO_MIX_RATIO_END:-0.0}"
 PPO_MIX_ANNEAL_UPDATES="${PPO_MIX_ANNEAL_UPDATES:-50}"
 
 # Exploration & gradual un-tethering from bot.js reference policy across the 12h run
-PPO_ENT_COEF="${PPO_ENT_COEF:-0.020}"
-PPO_ENT_COEF_END="${PPO_ENT_COEF_END:-0.002}"
-PPO_STRATEGIC_ENT_MULT="${PPO_STRATEGIC_ENT_MULT:-2.5}"
-PPO_KL_COEF="${PPO_KL_COEF:-0.03}"
-PPO_KL_COEF_END="${PPO_KL_COEF_END:-0.0}"
+# Sub-step entropy weighting (src=0.5, tgt=0.15, opt=0.15 on PREP) prevents 36-tile x 4-dir MOVE entropy hacking,
+# while strategic_ent_mult=3.5 preserves full macro exploration on band/bond/SP/choice steps.
+PPO_ENT_COEF="${PPO_ENT_COEF:-0.004}"
+PPO_ENT_COEF_END="${PPO_ENT_COEF_END:-0.0005}"
+PPO_STRATEGIC_ENT_MULT="${PPO_STRATEGIC_ENT_MULT:-3.5}"
+PPO_SRC_ENT_WEIGHT="${PPO_SRC_ENT_WEIGHT:-0.5}"
+PPO_TGT_ENT_WEIGHT="${PPO_TGT_ENT_WEIGHT:-0.15}"
+PPO_OPT_ENT_WEIGHT="${PPO_OPT_ENT_WEIGHT:-0.15}"
+PPO_KL_COEF="${PPO_KL_COEF:-0.05}"
+PPO_KL_COEF_END="${PPO_KL_COEF_END:-0.005}"
 PPO_TARGET_KL="${PPO_TARGET_KL:-0.05}"
 
 # Round-boundary discounting (gamma_intra=1.0, gamma_round=0.97) + terminal/Hidden Core reward shaping
@@ -186,6 +191,9 @@ run_ppo() {
     --ent-coef "${PPO_ENT_COEF}" \
     --ent-coef-end "${PPO_ENT_COEF_END}" \
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
+    --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
+    --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
+    --opt-ent-weight "${PPO_OPT_ENT_WEIGHT}" \
     --kl-coef "${PPO_KL_COEF}" \
     --kl-coef-end "${PPO_KL_COEF_END}" \
     --target-kl "${PPO_TARGET_KL}" \

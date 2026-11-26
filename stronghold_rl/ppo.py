@@ -46,6 +46,9 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     strategic_ent_mult: float = 1.0   # extra entropy weight on macro-strategic steps (band/bond/SP/choice)
+    src_ent_weight: float = 0.5       # weight of step-2 source-pointer entropy on non-strategic steps
+    tgt_ent_weight: float = 0.15      # weight of step-3 target-pointer entropy (prevents 36-tile MOVE entropy hacking)
+    opt_ent_weight: float = 0.15      # weight of step-4 facing/replace-slot entropy on non-strategic steps
     kl_coef: float = 0.05             # anchor penalty to frozen BC reference policy (0 disables)
     target_kl: float = 0.05           # early-stop remaining PPO epochs when approx_kl exceeds this (0 disables)
     lr: float = 3e-5                  # gentle actor+backbone LR for 4-step autoregressive fine-tuning
@@ -508,6 +511,7 @@ def ppo_update(
     sum_ploss = 0.0
     sum_vloss = 0.0
     sum_ent = 0.0
+    sum_explore_ent = 0.0
     sum_strat_ent = 0.0
     n_strat_batches = 0
     sum_kl_bc = 0.0
@@ -536,19 +540,28 @@ def ppo_update(
                 value_loss = nn.functional.mse_loss(out["value"], mb["returns"])
                 ent_vec = out["entropy"]
                 entropy = ent_vec.mean()
+                substep_ent = (
+                    out["type_ent"]
+                    + out["band_ent"]
+                    + float(c.src_ent_weight) * out["src_ent"]
+                    + float(c.tgt_ent_weight) * out["tgt_ent"]
+                    + float(c.opt_ent_weight) * out["opt_ent"]
+                )
                 is_strat = mb.get("is_strategic")
-                if is_strat is not None and is_strat.any():
-                    sum_strat_ent += float(ent_vec[is_strat].mean().item())
-                    n_strat_batches += 1
-                if is_strat is not None and abs(c.strategic_ent_mult - 1.0) > 1e-6:
-                    ent_weights = torch.where(
+                if is_strat is not None:
+                    if is_strat.any():
+                        sum_strat_ent += float(ent_vec[is_strat].mean().item())
+                        n_strat_batches += 1
+                    # Keep full entropy on macro-strategic decisions (band/bond/SP/choice) scaled by
+                    # strategic_ent_mult, while down-weighting PREP src/tgt/opt to prevent 36x4 MOVE hacking.
+                    explore_ent_vec = torch.where(
                         is_strat,
-                        torch.full_like(ent_vec, float(c.strategic_ent_mult)),
-                        torch.ones_like(ent_vec),
+                        ent_vec * float(c.strategic_ent_mult),
+                        substep_ent,
                     )
-                    weighted_entropy = (ent_vec * ent_weights).mean()
                 else:
-                    weighted_entropy = entropy
+                    explore_ent_vec = substep_ent
+                weighted_entropy = explore_ent_vec.mean()
 
                 if critic_only:
                     policy_loss = torch.zeros((), device=device)
@@ -580,6 +593,7 @@ def ppo_update(
                 sum_ploss += float(policy_loss.item())
                 sum_vloss += float(value_loss.item())
                 sum_ent += float(entropy.item())
+                sum_explore_ent += float(weighted_entropy.item())
                 sum_kl_bc += float(kl_bc.item())
                 kl_val = float(approx_kl.item())
                 sum_approx_kl += kl_val
@@ -601,6 +615,7 @@ def ppo_update(
         "policy_loss": sum_ploss / denom,
         "value_loss": sum_vloss / denom,
         "entropy": sum_ent / denom,
+        "explore_entropy": sum_explore_ent / denom,
         "strategic_entropy": sum_strat_ent / max(1, n_strat_batches),
         "kl_to_bc": sum_kl_bc / denom,
         "approx_kl": sum_approx_kl / denom,
@@ -634,6 +649,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--ent-coef", type=float, default=0.01, help="Initial entropy bonus coefficient")
     parser.add_argument("--ent-coef-end", type=float, default=-1.0, help="Optional final entropy coef for linear annealing (<0 disables)")
     parser.add_argument("--strategic-ent-mult", type=float, default=1.0, help="Entropy multiplier on macro-strategic decisions")
+    parser.add_argument("--src-ent-weight", type=float, default=0.5, help="Non-strategic step-2 source-pointer entropy weight")
+    parser.add_argument("--tgt-ent-weight", type=float, default=0.15, help="Non-strategic step-3 target-tile pointer entropy weight")
+    parser.add_argument("--opt-ent-weight", type=float, default=0.15, help="Non-strategic step-4 facing/replace-slot entropy weight")
     parser.add_argument("--kl-coef", type=float, default=0.05, help="Initial KL anchor penalty to reference checkpoint")
     parser.add_argument("--kl-coef-end", type=float, default=-1.0, help="Optional final KL coef for linear annealing (<0 disables)")
     parser.add_argument("--target-kl", type=float, default=0.05)
@@ -704,6 +722,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         ppo_epochs=args.ppo_epochs,
         ent_coef=args.ent_coef,
         strategic_ent_mult=args.strategic_ent_mult,
+        src_ent_weight=args.src_ent_weight,
+        tgt_ent_weight=args.tgt_ent_weight,
+        opt_ent_weight=args.opt_ent_weight,
         kl_coef=args.kl_coef if ref_model is not None else 0.0,
         target_kl=args.target_kl,
         minibatch_size=args.minibatch_size,
@@ -836,7 +857,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"steps={r_stats['transitions']} forced_rdy={r_stats['forced_readies']}{bs_info}{err_info} "
                 f"({r_stats['elapsed_sec']:.1f}s) | "
                 f"ploss={u_stats['policy_loss']:.4f} vloss={u_stats['value_loss']:.4f} "
-                f"ent={u_stats['entropy']:.3f}{strat_info} akl={u_stats['approx_kl']:.4f} "
+                f"ent={u_stats['entropy']:.3f} e_ent={u_stats['explore_entropy']:.2f}{strat_info} akl={u_stats['approx_kl']:.4f} "
                 f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{sched_info}{stop_flag}",
                 flush=True,
             )
