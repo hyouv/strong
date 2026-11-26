@@ -1,8 +1,12 @@
 # Project-local runtimes and environments
 /.venv/
 /.tools/
+/.tmp_pip/
 /artifacts/
 /build/
+/checkpoints/
+/data/
+/logs/
 
 # Python artifacts
 __pycache__/
