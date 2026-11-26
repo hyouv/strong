@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import gzip
 import io
 import json
+import multiprocessing
 from pathlib import Path
 import time
 from typing import Any, Mapping, Sequence
@@ -156,9 +157,14 @@ class BCDataset:
         return cls(**raw)
 
 
-def _encode_replay_bytes(payload: tuple[bytes, float]) -> dict[str, torch.Tensor] | None:
-    """Worker-process helper: decompress & encode one compressed expert replay into stacked tensors."""
+def _encode_replay_bytes(payload: tuple[bytes, float]) -> bytes | None:
+    """Worker-process helper: decompress & encode one compressed expert replay into serialized bytes.
+
+    Returning plain `bytes` avoids PyTorch multiprocessing `file_descriptor` shared-memory FD passing,
+    which otherwise exhausts `ulimit -n` (e.g. 1024) on Linux with 32+ parallel workers.
+    """
     replay_bytes, ep_return = payload
+    torch.set_num_threads(1)
     cat = get_catalog()
     with gzip.GzipFile(fileobj=io.BytesIO(replay_bytes), mode="rb") as gz:
         rows = [json.loads(line) for line in gz]
@@ -225,7 +231,7 @@ def _encode_replay_bytes(payload: tuple[bytes, float]) -> dict[str, torch.Tensor
     if not a_type_list:
         return None
     n = len(a_type_list)
-    return {
+    tensors = {
         "cat_ids": torch.stack(cat_ids_list),
         "cont_feats": torch.stack(cont_list),
         "valid_mask": torch.stack(valid_list),
@@ -244,6 +250,9 @@ def _encode_replay_bytes(payload: tuple[bytes, float]) -> dict[str, torch.Tensor
         "has_opt": torch.tensor(has_opt_list, dtype=torch.bool),
         "returns": torch.full((n,), ep_return, dtype=torch.float32),
     }
+    buf = io.BytesIO()
+    torch.save(tensors, buf)
+    return buf.getvalue()
 
 
 def collect_solo_expert_dataset(
@@ -271,7 +280,11 @@ def collect_solo_expert_dataset(
     total_episodes = 0
     chunks: list[dict[str, torch.Tensor]] = []
 
-    enc_pool = ProcessPoolExecutor(max_workers=n_enc) if use_mp else None
+    enc_pool = (
+        ProcessPoolExecutor(max_workers=n_enc, mp_context=multiprocessing.get_context("spawn"))
+        if use_mp
+        else None
+    )
     try:
         with RoomPool(num_workers=n_sim) as pool:
             ep = 0
@@ -305,12 +318,13 @@ def collect_solo_expert_dataset(
                     payloads.append((res["replay"], ep_return))
 
                 if enc_pool is not None:
-                    encoded = list(enc_pool.map(_encode_replay_bytes, payloads))
+                    encoded_blobs = list(enc_pool.map(_encode_replay_bytes, payloads))
                 else:
-                    encoded = [_encode_replay_bytes(p) for p in payloads]
+                    encoded_blobs = [_encode_replay_bytes(p) for p in payloads]
 
-                for ch in encoded:
-                    if ch is not None:
+                for blob in encoded_blobs:
+                    if blob is not None:
+                        ch = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=True)
                         chunks.append(ch)
 
                 if verbose:

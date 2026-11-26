@@ -13,6 +13,9 @@
 
 set -euo pipefail
 
+# Raise soft open-file limit if permitted (defense-in-depth for 32+ workers)
+ulimit -n 65535 2>/dev/null || ulimit -n "$(ulimit -Hn 2>/dev/null || echo 1024)" 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "${ROOT_DIR}"
