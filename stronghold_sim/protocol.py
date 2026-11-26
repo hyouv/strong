@@ -17,6 +17,20 @@ COOP_MODES: tuple[str, ...] = (
     "mode_multi_abyss",
 )
 
+SOLO_TIER1_MODES: tuple[str, ...] = (
+    "mode_single_1",
+    "mode_single_2",
+    "mode_single_3",
+    "mode_single_4",
+)
+
+SOLO_MODES: tuple[str, ...] = (
+    "mode_single_funny",
+    *(f"mode_single_{i}" for i in range(1, 21)),
+)
+
+ALL_MODES: tuple[str, ...] = COOP_MODES + SOLO_MODES
+
 SEATS_PER_COOP_GAME = 4
 
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Encapsulated four-seat Regulation co-op match session driven by external decisions.
-import { config, data, source, COOP_MODES } from './context.mjs';
+import { config, data, source, COOP_MODES, ALL_MODES, isSoloMode } from './context.mjs';
 import { Match } from '../engine/server/match/Match.js';
 import { VirtualScheduler } from '../engine/server/match/scheduler.js';
 import { actionsFor } from './candidates.mjs';
@@ -44,8 +44,9 @@ export class RoomSession {
         ? match.players.get(match.spTurn())
         : null;
     }
-    for (let i = 0; i < 4; i++) {
-      const ps = match.order[(this.cursor + i) % 4];
+    const seatCount = match.order.length;
+    for (let i = 0; i < seatCount; i++) {
+      const ps = match.order[(this.cursor + i) % seatCount];
       if (
         (phase === 'INFO_CHECK' && !ps.infoReady) ||
         (phase === 'CUSTOM_CHECK' && ps.diyBring == null) ||
@@ -142,10 +143,12 @@ export class RoomSession {
 
   reset(seed, requestedMode, version = null) {
     if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) throw Error('Invalid seed');
-    if (!COOP_MODES.includes(requestedMode)) throw Error('Invalid cooperative mode');
+    if (!ALL_MODES.includes(requestedMode)) throw Error('Invalid mode');
     if (version !== null && (!Number.isSafeInteger(version) || version < 0)) {
       throw Error('Invalid policy version');
     }
+    const solo = isSoloMode(requestedMode);
+    const seatCount = solo ? 1 : 4;
     this.policyVersion = version;
     this.modeId = requestedMode;
     this.match?.dispose();
@@ -154,7 +157,7 @@ export class RoomSession {
     this.failures = 0;
     this.collected = 0;
     this.errors = [];
-    this.actionsBySeat = [0, 0, 0, 0];
+    this.actionsBySeat = Array(seatCount).fill(0);
     this.summary = null;
     this.frame = null;
     this.detail = null;
@@ -164,12 +167,12 @@ export class RoomSession {
     this.match = new Match({
       version: config.version,
       data,
-      mode: 'coop',
+      mode: solo ? 'solo' : 'coop',
       modeId: this.modeId,
       difficulty: data.config.modes[this.modeId].difficulty,
       roomCode: 'POLICY',
       seed,
-      seats: Array.from({ length: 4 }, (_, seat) => ({
+      seats: Array.from({ length: seatCount }, (_, seat) => ({
         seat,
         playerId: 'p' + seat,
         name: 'Seat ' + seat,
@@ -226,7 +229,7 @@ export class RoomSession {
     const previous = { seat, action, accepted: !!result?.ok, code: result?.code ?? null };
     if (result?.ok) {
       this.actionsBySeat[seat]++;
-      this.cursor = (seat + 1) % 4;
+      this.cursor = (seat + 1) % this.match.order.length;
       this.rejected.clear();
     } else {
       // Some content handlers validate an effect only upon use. The real refusal is an observed transition.

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { isDeepStrictEqual } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { config, data, source, COOP_MODES } from './context.mjs';
+import { config, data, source, ALL_MODES, isSoloMode } from './context.mjs';
 import { Match } from '../engine/server/match/Match.js';
 import { VirtualScheduler } from '../engine/server/match/scheduler.js';
 import { botPrepBeginSteps, botPrepEndSteps, botPickBand, botPickCard } from '../engine/server/match/bot.js';
@@ -58,9 +58,11 @@ function prepareRound(match, seats, turnOrder) {
 
 export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrder = 'serial') {
   if (!['serial', 'interleaved'].includes(turnOrder)) throw Error('Unknown teacher turn order');
-  if (!COOP_MODES.includes(modeId) || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+  if (!ALL_MODES.includes(modeId) || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
     throw Error('Invalid demonstration request');
   }
+  const solo = isSoloMode(modeId);
+  const seatCount = solo ? 1 : 4;
   const inMemory = directory === null;
   if (inMemory && (!Number.isSafeInteger(memoryLimit) || memoryLimit <= 0)) {
     throw Error('Invalid replay memory lease');
@@ -96,12 +98,12 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
   const match = new Match({
     version: config.version,
     data,
-    mode: 'coop',
+    mode: solo ? 'solo' : 'coop',
     modeId,
     difficulty: data.config.modes[modeId].difficulty,
     roomCode: 'EXPERT',
     seed,
-    seats: Array.from({ length: 4 }, (_, seat) => ({
+    seats: Array.from({ length: seatCount }, (_, seat) => ({
       seat,
       playerId: 'p' + seat,
       name: 'Seat ' + seat,
@@ -185,7 +187,7 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
       source,
       modeId,
       seed,
-      seats: 4,
+      seats: seatCount,
       scope: 'full_match',
       candidateVersion: 2,
       ...provenance,

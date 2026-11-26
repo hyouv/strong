@@ -28,6 +28,17 @@ export const COOP_MODES = Object.freeze([
   'mode_multi_abyss',
 ]);
 
+export const SOLO_MODES = Object.freeze([
+  'mode_single_funny',
+  ...Array.from({ length: 20 }, (_, i) => `mode_single_${i + 1}`),
+]);
+
+export const ALL_MODES = Object.freeze([...COOP_MODES, ...SOLO_MODES]);
+
+export function isSoloMode(modeId) {
+  return SOLO_MODES.includes(modeId);
+}
+
 const dataErrors = [];
 export const data = getVersionData(config.version, {
   log: {
@@ -43,7 +54,7 @@ if (data.config?.version?.id !== config.version || dataErrors.length) {
 setData(data);
 rememberOfficialBounds(data);
 
-if (getData() !== data || COOP_MODES.some((id) => !data.config.modes[id])) {
+if (getData() !== data || ALL_MODES.some((id) => !data.config.modes[id])) {
   throw new Error('Wrong rules');
 }
 
