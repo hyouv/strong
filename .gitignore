@@ -14,6 +14,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# Local experiment notes and task lists
+/EXPERIMENTS.md
+/TODO.md
+
 # Logs and temporary files
 *.log
 *.tmp
