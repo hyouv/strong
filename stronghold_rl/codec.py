@@ -161,6 +161,17 @@ def _log_norm(val: float | int | None, scale: float = 1.0) -> float:
     return math.log1p(float(val)) / scale
 
 
+@dataclass(slots=True)
+class ActionMaskSpec:
+    """Lightweight, tensor-free legal mask index safe for cross-process IPC (zero PyTorch FDs)."""
+
+    type_mask_bytes: bytes
+    src_keys: dict[int, list[int]]
+    tgt_keys: dict[tuple[int, int], list[int]]
+    opt_bits: dict[tuple[int, int, int], int]
+    num_bands: int
+
+
 @dataclass
 class ActionTree:
     """Lossless prefix-tree index over `frame['actions']` for exact hierarchical masking."""
@@ -175,6 +186,22 @@ class ActionTree:
     opt_to_key: dict[tuple[int, int, int, int], int]
     key_to_tuple: list[tuple[int, int, int, int]]
     num_bands: int
+
+    def to_mask_spec(self) -> ActionMaskSpec:
+        """Convert to a compact pure-Python mask spec for multiprocess actor IPC."""
+        opt_bits: dict[tuple[int, int, int], int] = {}
+        for k, opts in self.opt_keys.items():
+            bits = 0
+            for o in opts:
+                bits |= 1 << o
+            opt_bits[k] = bits
+        return ActionMaskSpec(
+            type_mask_bytes=self.type_mask.to(torch.uint8).numpy().tobytes(),
+            src_keys=self.src_keys,
+            tgt_keys=self.tgt_keys,
+            opt_bits=opt_bits,
+            num_bands=self.num_bands,
+        )
 
     def src_mask(self, a_type: int) -> torch.Tensor | None:
         srcs = self.src_keys.get(a_type)

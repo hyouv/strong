@@ -31,6 +31,7 @@ from .codec import (
     encode_frame,
 )
 from .model import PolicyConfig, StrongholdPolicyNet, extract_step_masks
+from .rollout import AsyncActorPool
 
 
 def resolve_device(device_arg: str) -> str:
@@ -608,8 +609,12 @@ def evaluate_policy_solo(
     max_prep_steps_per_round: int = 80,
     device: torch.device | str = "cpu",
     catalog: GameCatalog | None = None,
+    pool: AsyncActorPool | None = None,
+    use_async_pool: bool = True,
+    min_batch: int = 0,
+    batch_timeout_ms: float = 2.0,
 ) -> dict[str, Any]:
-    """Run live solo evaluation in parallel via RoomPool + batched GPU inference."""
+    """Run live solo evaluation in parallel via AsyncActorPool (or RoomPool fallback) + batched GPU inference."""
     cat = catalog if catalog is not None else get_catalog()
     model.eval()
     t0 = time.perf_counter()
@@ -619,14 +624,45 @@ def evaluate_policy_solo(
     if total_eps == 0:
         return {"episodes": 0, "win_rate": 0.0, "avg_rounds_passed": 0.0, "avg_steps": 0.0, "forced_readies": 0, "cycle_breaks": 0}
 
+    n_workers = max(1, min(num_workers, total_eps))
+    if pool is not None:
+        return pool.evaluate_episodes(
+            model,
+            modes=modes,
+            seeds=seeds,
+            deterministic=deterministic,
+            temperature=temperature,
+            break_cycles=break_cycles,
+            max_prep_steps_per_round=max_prep_steps_per_round,
+            min_batch=min_batch if min_batch > 0 else None,
+            batch_timeout_ms=batch_timeout_ms,
+            device=device,
+        )
+    if use_async_pool and n_workers >= 2:
+        with AsyncActorPool(
+            num_workers=n_workers,
+            min_batch=min_batch,
+            batch_timeout_ms=batch_timeout_ms,
+        ) as async_pool:
+            return async_pool.evaluate_episodes(
+                model,
+                modes=modes,
+                seeds=seeds,
+                deterministic=deterministic,
+                temperature=temperature,
+                break_cycles=break_cycles,
+                max_prep_steps_per_round=max_prep_steps_per_round,
+                device=device,
+            )
+
     wins = 0
     rounds_list: list[int] = []
     steps_list: list[int] = []
     forced_readies = 0
     cycle_breaks = 0
 
-    n_workers = max(1, min(num_workers, total_eps))
-    with RoomPool(num_workers=n_workers) as pool:
+    with RoomPool(num_workers=n_workers) as sync_pool:
+        pool_ref = sync_pool
         next_ep = 0
         ep_steps: dict[int, int] = {}
         ep_prep_steps: dict[int, int] = {}
@@ -649,7 +685,7 @@ def evaluate_policy_solo(
             ep_last_round[w] = -1
             ep_seen_sigs[w] = {}
             next_ep += 1
-        active_frames = pool.exchange(init_cmds)
+        active_frames = pool_ref.exchange(init_cmds)
 
         while active_frames:
             step_cmds: dict[int, dict[str, Any]] = {}
@@ -745,7 +781,7 @@ def evaluate_policy_solo(
                             "policy_version": 0,
                         }
 
-            replies = pool.exchange(step_cmds)
+            replies = pool_ref.exchange(step_cmds)
             reset_cmds: dict[int, dict[str, Any]] = {}
             next_active: dict[int, dict[str, Any]] = {}
 
@@ -766,7 +802,7 @@ def evaluate_policy_solo(
                     next_active[w] = rep
 
             if reset_cmds:
-                next_active.update(pool.exchange(reset_cmds))
+                next_active.update(pool_ref.exchange(reset_cmds))
             active_frames = next_active
 
     return {

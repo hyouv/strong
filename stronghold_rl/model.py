@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,8 @@ from .codec import (
     TYPE_BAND,
     TYPE_EQUIP,
     VALUE_CLS_IDX,
+    ActionMaskSpec,
+    ActionTree,
     EncodedFrame,
 )
 
@@ -159,30 +162,41 @@ def _masked_smoothed_nll(
     return loss
 
 
-def _sample_from_logits(
+def _sample_batch_masked(
     logits: torch.Tensor,
     mask: torch.Tensor,
-    deterministic: bool,
+    *,
+    active: torch.Tensor | None = None,
+    deterministic: bool = False,
     temperature: float = 1.0,
-) -> tuple[int, torch.Tensor, torch.Tensor]:
-    """Sample or argmax one index from a 1D masked logit vector, returning (idx, log_prob, entropy).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized batched masked sampling over `[B, K]` logits -> `(idx [B], log_prob [B], entropy [B])`.
 
-    Note: returned `log_prob` and `entropy` are always from the unscaled policy distribution (`T=1.0`)
-    so PPO importance ratios remain exact; `temperature` only shapes sampling sharpness during inference.
+    Returned `log_prob` and `entropy` always come from the unscaled `T=1.0` distribution so PPO
+    importance ratios remain exact; inactive rows return `log_prob=0.0`, `entropy=0.0`.
     """
-    masked = logits.masked_fill(~mask, -1e9)
-    log_probs = F.log_softmax(masked, dim=-1)
-    probs = log_probs.exp()
-    entropy = -(probs * log_probs.clamp(min=-1e4)).sum()
+    log_probs, entropy = _masked_log_softmax_and_entropy(logits, mask, active=active)
+    safe_mask = mask.clone()
+    if active is not None:
+        inactive = ~active
+        if inactive.any():
+            safe_mask[inactive, 0] = True
+
     if deterministic or temperature <= 0.0:
-        idx = int(torch.argmax(masked).item())
+        idx = logits.masked_fill(~safe_mask, -1e9).argmax(dim=-1)
     elif abs(temperature - 1.0) < 1e-6:
-        idx = int(torch.multinomial(probs, num_samples=1).item())
+        probs = log_probs.exp()
+        idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
     else:
-        scaled = (logits / float(temperature)).masked_fill(~mask, -1e9)
+        scaled = (logits / float(temperature)).masked_fill(~safe_mask, -1e9)
         sample_probs = F.softmax(scaled, dim=-1)
-        idx = int(torch.multinomial(sample_probs, num_samples=1).item())
-    return idx, log_probs[idx], entropy
+        idx = torch.multinomial(sample_probs, num_samples=1).squeeze(-1)
+
+    ar = torch.arange(logits.shape[0], device=logits.device)
+    chosen_lp = log_probs[ar, idx]
+    if active is not None:
+        chosen_lp = chosen_lp * active.to(chosen_lp.dtype)
+    return idx, chosen_lp, entropy
 
 
 class StrongholdPolicyNet(nn.Module):
@@ -306,6 +320,239 @@ class StrongholdPolicyNet(nn.Module):
         return self.out_drop(self.out_norm(h))
 
     @torch.no_grad()
+    def act_batch_tensors(
+        self,
+        cat_ids: torch.Tensor,
+        cont_feats: torch.Tensor,
+        valid_mask: torch.Tensor,
+        mask_specs: Sequence[ActionMaskSpec | ActionTree],
+        *,
+        deterministic: bool = False,
+        temperature: float = 1.0,
+        device: torch.device | str = "cpu",
+    ) -> dict[str, Any]:
+        """Fully vectorized batched Transformer forward + 4-step autoregressive pointer decoding.
+
+        Accepts pre-stacked CPU tensors `[B, N, ...]` and lightweight `ActionMaskSpec` (or `ActionTree`)
+        objects, performing at most 4 bulk GPU->CPU syncs per batch regardless of batch size `B`.
+        """
+        B = int(cat_ids.shape[0])
+        if B == 0:
+            return {
+                "a_type": [],
+                "a_src": [],
+                "a_tgt": [],
+                "a_opt": [],
+                "log_prob": [],
+                "entropy": [],
+                "value": [],
+                "type_mask": torch.zeros((0, NUM_ACTION_TYPES), dtype=torch.bool),
+                "src_mask": torch.zeros((0, NUM_TOKENS), dtype=torch.bool),
+                "has_src": torch.zeros((0,), dtype=torch.bool),
+                "band_mask": torch.zeros((0, self.num_bands), dtype=torch.bool),
+                "has_band": torch.zeros((0,), dtype=torch.bool),
+                "tgt_mask": torch.zeros((0, NUM_TOKENS), dtype=torch.bool),
+                "has_tgt": torch.zeros((0,), dtype=torch.bool),
+                "opt_mask": torch.zeros((0, NUM_SUB_OPTS), dtype=torch.bool),
+                "has_opt": torch.zeros((0,), dtype=torch.bool),
+            }
+
+        cat_dev = cat_ids.to(device, non_blocking=True)
+        cont_dev = cont_feats.to(device, non_blocking=True)
+        valid_dev = valid_mask.to(device, non_blocking=True)
+        ar = torch.arange(B, device=device)
+
+        h_all = self.encode_tokens(cat_dev, cont_dev, valid_dev)    # [B, N, D]
+        g_pol_all = h_all[:, POLICY_CLS_IDX]                        # [B, D]
+        g_val_all = h_all[:, VALUE_CLS_IDX]                         # [B, D]
+        values_all = self.value_head(g_val_all).squeeze(-1)         # [B]
+        type_logits_all = self.type_head(g_pol_all)                 # [B, NUM_ACTION_TYPES]
+
+        # ---- Step 1: Action Type -------------------------------------------
+        type_mask_cpu = torch.zeros((B, NUM_ACTION_TYPES), dtype=torch.bool)
+        for i, spec in enumerate(mask_specs):
+            if isinstance(spec, ActionMaskSpec):
+                tm = np.frombuffer(spec.type_mask_bytes, dtype=np.bool_)
+                type_mask_cpu[i] = torch.from_numpy(tm.copy())
+            else:
+                type_mask_cpu[i] = spec.type_mask
+
+        a_type_dev, total_lp, total_ent = _sample_batch_masked(
+            type_logits_all,
+            type_mask_cpu.to(device, non_blocking=True),
+            deterministic=deterministic,
+            temperature=temperature,
+        )
+        a_type_list: list[int] = a_type_dev.cpu().tolist()
+
+        # ---- Step 2: Source Entity Pointer or Band Choice ------------------
+        src_mask_cpu = torch.zeros((B, NUM_TOKENS), dtype=torch.bool)
+        has_src_cpu = torch.zeros(B, dtype=torch.bool)
+        band_mask_cpu = torch.zeros((B, self.num_bands), dtype=torch.bool)
+        has_band_cpu = torch.zeros(B, dtype=torch.bool)
+        any_src = False
+        any_band = False
+
+        for i, (spec, a_type) in enumerate(zip(mask_specs, a_type_list)):
+            srcs = spec.src_keys.get(a_type)
+            if not srcs:
+                continue
+            if a_type == TYPE_BAND:
+                band_mask_cpu[i, srcs] = True
+                has_band_cpu[i] = True
+                any_band = True
+            else:
+                src_mask_cpu[i, srcs] = True
+                has_src_cpu[i] = True
+                any_src = True
+
+        a_src_list = [NO_ARG] * B
+        a_tgt_list = [NO_ARG] * B
+        a_opt_list = [NO_ARG] * B
+
+        tgt_mask_cpu = torch.zeros((B, NUM_TOKENS), dtype=torch.bool)
+        has_tgt_cpu = torch.zeros(B, dtype=torch.bool)
+        opt_mask_cpu = torch.zeros((B, NUM_SUB_OPTS), dtype=torch.bool)
+        has_opt_cpu = torch.zeros(B, dtype=torch.bool)
+
+        if any_src or any_band:
+            ctx1 = self.src_ctx_proj(torch.cat([g_pol_all, self.type_emb(a_type_dev)], dim=-1))
+            src_choice_list: list[int] | None = None
+            band_choice_list: list[int] | None = None
+
+            if any_src:
+                src_keys_all = self.src_key_proj(h_all)
+                src_logits = torch.einsum("bd,bnd->bn", ctx1, src_keys_all) * self._scale
+                src_idx, lp_src, ent_src = _sample_batch_masked(
+                    src_logits,
+                    src_mask_cpu.to(device, non_blocking=True),
+                    active=has_src_cpu.to(device, non_blocking=True),
+                    deterministic=deterministic,
+                    temperature=temperature,
+                )
+                total_lp = total_lp + lp_src
+                total_ent = total_ent + ent_src
+                src_choice_list = src_idx.cpu().tolist()
+
+            if any_band:
+                band_logits = self.band_head(ctx1)
+                band_idx, lp_band, ent_band = _sample_batch_masked(
+                    band_logits,
+                    band_mask_cpu.to(device, non_blocking=True),
+                    active=has_band_cpu.to(device, non_blocking=True),
+                    deterministic=deterministic,
+                    temperature=temperature,
+                )
+                total_lp = total_lp + lp_band
+                total_ent = total_ent + ent_band
+                band_choice_list = band_idx.cpu().tolist()
+
+            any_tgt = False
+            for i in range(B):
+                if has_band_cpu[i]:
+                    assert band_choice_list is not None
+                    a_src_list[i] = band_choice_list[i]
+                elif has_src_cpu[i]:
+                    assert src_choice_list is not None
+                    s_idx = src_choice_list[i]
+                    a_src_list[i] = s_idx
+                    tgts = mask_specs[i].tgt_keys.get((a_type_list[i], s_idx))
+                    if tgts:
+                        tgt_mask_cpu[i, tgts] = True
+                        has_tgt_cpu[i] = True
+                        any_tgt = True
+
+            # ---- Step 3: Target Pointer ------------------------------------
+            if any_tgt:
+                safe_src = torch.tensor(
+                    [s if 0 <= s < NUM_TOKENS else 0 for s in a_src_list],
+                    dtype=torch.long,
+                    device=device,
+                )
+                src_h = h_all[ar, safe_src]
+                ctx2 = self.tgt_ctx_proj(torch.cat([ctx1, src_h], dim=-1))
+                tgt_keys_all = self.tgt_key_proj(h_all)
+                tgt_logits = torch.einsum("bd,bnd->bn", ctx2, tgt_keys_all) * self._scale
+                tgt_idx, lp_tgt, ent_tgt = _sample_batch_masked(
+                    tgt_logits,
+                    tgt_mask_cpu.to(device, non_blocking=True),
+                    active=has_tgt_cpu.to(device, non_blocking=True),
+                    deterministic=deterministic,
+                    temperature=temperature,
+                )
+                total_lp = total_lp + lp_tgt
+                total_ent = total_ent + ent_tgt
+                tgt_choice_list: list[int] = tgt_idx.cpu().tolist()
+
+                any_opt = False
+                for i in range(B):
+                    if not has_tgt_cpu[i]:
+                        continue
+                    t_idx = tgt_choice_list[i]
+                    a_tgt_list[i] = t_idx
+                    spec = mask_specs[i]
+                    key3 = (a_type_list[i], a_src_list[i], t_idx)
+                    if isinstance(spec, ActionMaskSpec):
+                        bits = spec.opt_bits.get(key3, 0)
+                        if bits:
+                            for o in range(NUM_SUB_OPTS):
+                                if bits & (1 << o):
+                                    opt_mask_cpu[i, o] = True
+                            has_opt_cpu[i] = True
+                            any_opt = True
+                    else:
+                        opts = spec.opt_keys.get(key3)
+                        if opts:
+                            opt_mask_cpu[i, opts] = True
+                            has_opt_cpu[i] = True
+                            any_opt = True
+
+                # ---- Step 4: Sub-option (Direction / Replace Slot) ---------
+                if any_opt:
+                    safe_tgt = torch.tensor(
+                        [t if 0 <= t < NUM_TOKENS else 0 for t in a_tgt_list],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    tgt_h = h_all[ar, safe_tgt]
+                    ctx3 = self.opt_ctx_proj(torch.cat([ctx2, tgt_h], dim=-1))
+                    is_equip = (a_type_dev == TYPE_EQUIP).unsqueeze(-1)
+                    opt_logits = torch.where(is_equip, self.replace_head(ctx3), self.dir_head(ctx3))
+                    opt_idx, lp_opt, ent_opt = _sample_batch_masked(
+                        opt_logits,
+                        opt_mask_cpu.to(device, non_blocking=True),
+                        active=has_opt_cpu.to(device, non_blocking=True),
+                        deterministic=deterministic,
+                        temperature=temperature,
+                    )
+                    total_lp = total_lp + lp_opt
+                    total_ent = total_ent + ent_opt
+                    opt_choice_list: list[int] = opt_idx.cpu().tolist()
+                    for i in range(B):
+                        if has_opt_cpu[i]:
+                            a_opt_list[i] = opt_choice_list[i]
+
+        scalars = torch.stack([total_lp, total_ent, values_all], dim=0).cpu().tolist()
+        return {
+            "a_type": a_type_list,
+            "a_src": a_src_list,
+            "a_tgt": a_tgt_list,
+            "a_opt": a_opt_list,
+            "log_prob": scalars[0],
+            "entropy": scalars[1],
+            "value": scalars[2],
+            "type_mask": type_mask_cpu,
+            "src_mask": src_mask_cpu,
+            "has_src": has_src_cpu,
+            "band_mask": band_mask_cpu,
+            "has_band": has_band_cpu,
+            "tgt_mask": tgt_mask_cpu,
+            "has_tgt": has_tgt_cpu,
+            "opt_mask": opt_mask_cpu,
+            "has_opt": has_opt_cpu,
+        }
+
+    @torch.no_grad()
     def act_batch(
         self,
         encs: Sequence[EncodedFrame],
@@ -314,83 +561,49 @@ class StrongholdPolicyNet(nn.Module):
         temperature: float = 1.0,
         device: torch.device | str = "cpu",
     ) -> list[dict[str, Any]]:
-        """Batched Transformer forward pass + per-item 4-step autoregressive decoding."""
+        """Batched Transformer forward pass + vectorized 4-step autoregressive decoding."""
         if not encs:
             return []
-        cat_ids = torch.stack([e.cat_ids for e in encs]).to(device)
-        cont = torch.stack([e.cont_feats for e in encs]).to(device)
-        valid = torch.stack([e.valid_mask for e in encs]).to(device)
+        cat_ids = torch.stack([e.cat_ids for e in encs])
+        cont = torch.stack([e.cont_feats for e in encs])
+        valid = torch.stack([e.valid_mask for e in encs])
+        trees = [e.action_tree for e in encs]
 
-        h_all = self.encode_tokens(cat_ids, cont, valid)    # [B, N, D]
-        g_pol_all = h_all[:, POLICY_CLS_IDX]                # [B, D]
-        g_val_all = h_all[:, VALUE_CLS_IDX]                 # [B, D]
-        values_all = self.value_head(g_val_all).squeeze(-1) # [B]
-        type_logits_all = self.type_head(g_pol_all)         # [B, NUM_ACTION_TYPES]
-        src_keys_all = self.src_key_proj(h_all)             # [B, N, D]
-        tgt_keys_all = self.tgt_key_proj(h_all)             # [B, N, D]
+        out = self.act_batch_tensors(
+            cat_ids,
+            cont,
+            valid,
+            trees,
+            deterministic=deterministic,
+            temperature=temperature,
+            device=device,
+        )
 
         results: list[dict[str, Any]] = []
-        for i, enc in enumerate(encs):
-            h = h_all[i]
-            g_pol = g_pol_all[i]
-            tree = enc.action_tree
-            total_lp = torch.zeros((), device=device)
-            total_ent = torch.zeros((), device=device)
-
-            # Step 1: Action Type
-            type_mask = tree.type_mask.to(device)
-            a_type, lp1, ent1 = _sample_from_logits(type_logits_all[i], type_mask, deterministic, temperature)
-            total_lp = total_lp + lp1
-            total_ent = total_ent + ent1
-
-            a_src = NO_ARG
-            a_tgt = NO_ARG
-            a_opt = NO_ARG
-
-            # Step 2: Source Entity Pointer or Band Choice
-            sm = tree.src_mask(a_type)
-            if sm is not None:
-                t_emb = self.type_emb(torch.tensor(a_type, device=device))
-                ctx1 = self.src_ctx_proj(torch.cat([g_pol, t_emb], dim=-1))
-                sm_dev = sm.to(device)
-                if a_type == TYPE_BAND:
-                    band_logits = self.band_head(ctx1)
-                    a_src, lp2, ent2 = _sample_from_logits(band_logits, sm_dev, deterministic, temperature)
-                else:
-                    src_logits = (src_keys_all[i] @ ctx1) * self._scale
-                    a_src, lp2, ent2 = _sample_from_logits(src_logits, sm_dev, deterministic, temperature)
-                total_lp = total_lp + lp2
-                total_ent = total_ent + ent2
-
-                # Step 3: Target Pointer
-                tm = tree.tgt_mask(a_type, a_src)
-                if tm is not None:
-                    src_h = h[a_src]
-                    ctx2 = self.tgt_ctx_proj(torch.cat([ctx1, src_h], dim=-1))
-                    tgt_logits = (tgt_keys_all[i] @ ctx2) * self._scale
-                    a_tgt, lp3, ent3 = _sample_from_logits(tgt_logits, tm.to(device), deterministic, temperature)
-                    total_lp = total_lp + lp3
-                    total_ent = total_ent + ent3
-
-                    # Step 4: Sub-option (Direction or Replace Equip Slot)
-                    om = tree.opt_mask(a_type, a_src, a_tgt)
-                    if om is not None:
-                        tgt_h = h[a_tgt]
-                        ctx3 = self.opt_ctx_proj(torch.cat([ctx2, tgt_h], dim=-1))
-                        opt_logits = self.replace_head(ctx3) if a_type == TYPE_EQUIP else self.dir_head(ctx3)
-                        a_opt, lp4, ent4 = _sample_from_logits(opt_logits, om.to(device), deterministic, temperature)
-                        total_lp = total_lp + lp4
-                        total_ent = total_ent + ent4
-
+        for i, tree in enumerate(trees):
+            a_type = out["a_type"][i]
+            a_src = out["a_src"][i]
+            a_tgt = out["a_tgt"][i]
+            a_opt = out["a_opt"][i]
             action_key = tree.decode(a_type, a_src, a_tgt, a_opt)
-            masks = extract_step_masks(enc, a_type, a_src, a_tgt, a_opt)
+            masks = StepMasks(
+                type_mask=out["type_mask"][i],
+                src_mask=out["src_mask"][i],
+                has_src=bool(out["has_src"][i].item()),
+                band_mask=out["band_mask"][i],
+                has_band=bool(out["has_band"][i].item()),
+                tgt_mask=out["tgt_mask"][i],
+                has_tgt=bool(out["has_tgt"][i].item()),
+                opt_mask=out["opt_mask"][i],
+                has_opt=bool(out["has_opt"][i].item()),
+            )
             results.append(
                 {
                     "action_key": action_key,
                     "action_tuple": (a_type, a_src, a_tgt, a_opt),
-                    "log_prob": float(total_lp.item()),
-                    "entropy": float(total_ent.item()),
-                    "value": float(values_all[i].item()),
+                    "log_prob": float(out["log_prob"][i]),
+                    "entropy": float(out["entropy"][i]),
+                    "value": float(out["value"][i]),
                     "masks": masks,
                 }
             )

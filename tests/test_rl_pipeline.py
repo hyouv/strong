@@ -39,6 +39,7 @@ from stronghold_rl.codec import (
 )
 from stronghold_rl.model import PolicyConfig, StrongholdPolicyNet
 from stronghold_rl.ppo import PPOConfig, collect_ppo_rollouts, ppo_update
+from stronghold_rl.rollout import AsyncActorPool
 
 
 def test_solo_mode_codec_bijection_and_logprob_consistency() -> None:
@@ -215,3 +216,79 @@ def test_bc_cold_start_and_masked_ppo_smoke(tmp_path: Path) -> None:
     assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())
     assert u_stats["kl_to_bc"] >= 0.0
     assert u_stats["approx_kl"] >= 0.0
+
+
+def test_async_actor_pool_rollout_and_eval_parity() -> None:
+    """Verify AsyncActorPool + vectorized act_batch_tensors produce exact log_prob parity with evaluate_batch."""
+    cat = get_catalog()
+    cfg = PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128, dropout=0.0)
+    model = StrongholdPolicyNet(catalog=cat, config=cfg)
+    model.eval()
+
+    ppo_cfg = PPOConfig(max_prep_steps_per_round=25, kl_coef=0.0)
+    with AsyncActorPool(num_workers=2, min_batch=2, batch_timeout_ms=2.0) as pool:
+        rollout, r_stats = collect_ppo_rollouts(
+            model,
+            num_episodes=4,
+            modes=("mode_single_1", "mode_single_2"),
+            seed_start=23000,
+            num_workers=2,
+            ppo_cfg=ppo_cfg,
+            catalog=cat,
+            pool=pool,
+        )
+        assert r_stats["episodes"] == 4
+        assert r_stats["transitions"] > 20
+        assert r_stats["sim_errors"] == 0
+        assert r_stats["avg_batch_size"] >= 1.0
+
+        # Exact parity check between AsyncActorPool's old_log_prob and model.evaluate_batch
+        with torch.no_grad():
+            ev_out = model.evaluate_batch(rollout)
+        max_lp_diff = float((ev_out["log_prob"] - rollout["old_log_prob"]).abs().max().item())
+        assert max_lp_diff < 1e-4, f"AsyncActorPool log_prob mismatch vs evaluate_batch: {max_lp_diff}"
+
+        # Strict deterministic eval parity between AsyncActorPool and legacy sync RoomPool on identical seeds
+        ev_async = evaluate_policy_solo(
+            model,
+            modes=("mode_single_1", "mode_single_2"),
+            seeds=(9200, 9201),
+            num_workers=2,
+            deterministic=True,
+            break_cycles=False,
+            max_prep_steps_per_round=25,
+            catalog=cat,
+            pool=pool,
+        )
+        ev_sync = evaluate_policy_solo(
+            model,
+            modes=("mode_single_1", "mode_single_2"),
+            seeds=(9200, 9201),
+            num_workers=2,
+            deterministic=True,
+            break_cycles=False,
+            max_prep_steps_per_round=25,
+            catalog=cat,
+            use_async_pool=False,
+        )
+        assert ev_async["episodes"] == 2
+        assert ev_async["win_rate"] == ev_sync["win_rate"]
+        assert ev_async["avg_rounds_passed"] == ev_sync["avg_rounds_passed"]
+        assert ev_async["avg_steps"] == ev_sync["avg_steps"]
+        assert ev_async["forced_readies"] == ev_sync["forced_readies"]
+        assert ev_async["cycle_breaks"] == 0
+
+        # Also exercise cycle-breaking path in AsyncActorPool
+        ev_cb = evaluate_policy_solo(
+            model,
+            modes=("mode_single_1", "mode_single_2"),
+            seeds=(9200, 9201),
+            num_workers=2,
+            deterministic=True,
+            break_cycles=True,
+            max_prep_steps_per_round=25,
+            catalog=cat,
+            pool=pool,
+        )
+        assert ev_cb["episodes"] == 2
+        assert ev_cb["sim_errors"] == 0

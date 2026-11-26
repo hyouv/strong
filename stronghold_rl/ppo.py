@@ -33,6 +33,7 @@ from .bc import (
 from .catalog import GameCatalog, get_catalog
 from .codec import encode_frame
 from .model import PolicyConfig, StepMasks, StrongholdPolicyNet
+from .rollout import AsyncActorPool
 
 
 @dataclass
@@ -114,6 +115,75 @@ def _compute_ref_log_probs_batched(
     return torch.cat(out_chunks, dim=0)
 
 
+def _finalize_ppo_batch(
+    all_episodes: list[list[dict[str, Any]]],
+    *,
+    cfg: PPOConfig,
+    ref_model: StrongholdPolicyNet | None,
+    device: torch.device | str,
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Compute GAE advantages/returns, stack rollout tensors, and evaluate frozen BC ref log-probs."""
+    flat: list[dict[str, Any]] = []
+    adv_list: list[float] = []
+    ret_list: list[float] = []
+
+    for ep in all_episodes:
+        gae = 0.0
+        ep_adv = [0.0] * len(ep)
+        ep_ret = [0.0] * len(ep)
+        for i in range(len(ep) - 1, -1, -1):
+            tr = ep[i]
+            done = bool(tr["done"])
+            next_val = 0.0 if (i == len(ep) - 1 or done) else float(ep[i + 1]["value"])
+            non_term = 0.0 if done else 1.0
+            delta = float(tr["reward"]) + cfg.gamma * next_val * non_term - float(tr["value"])
+            gae = delta + cfg.gamma * cfg.gae_lambda * non_term * gae
+            ep_adv[i] = gae
+            ep_ret[i] = gae + float(tr["value"])
+        flat.extend(ep)
+        adv_list.extend(ep_adv)
+        ret_list.extend(ep_ret)
+
+    advantages = torch.tensor(adv_list, dtype=torch.float32)
+    if advantages.numel() > 1:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    old_log_prob = torch.tensor([t["old_log_prob"] for t in flat], dtype=torch.float32)
+    batch: dict[str, torch.Tensor] = {
+        "cat_ids": torch.stack([t["cat_ids"] for t in flat]),
+        "cont_feats": torch.stack([t["cont_feats"] for t in flat]),
+        "valid_mask": torch.stack([t["valid_mask"] for t in flat]),
+        "a_type": torch.tensor([t["a_type"] for t in flat], dtype=torch.long),
+        "a_src": torch.tensor([t["a_src"] for t in flat], dtype=torch.long),
+        "a_tgt": torch.tensor([t["a_tgt"] for t in flat], dtype=torch.long),
+        "a_opt": torch.tensor([t["a_opt"] for t in flat], dtype=torch.long),
+        "type_mask": torch.stack([t["type_mask"] for t in flat]),
+        "src_mask": torch.stack([t["src_mask"] for t in flat]),
+        "has_src": torch.tensor([t["has_src"] for t in flat], dtype=torch.bool),
+        "band_mask": torch.stack([t["band_mask"] for t in flat]),
+        "has_band": torch.tensor([t["has_band"] for t in flat], dtype=torch.bool),
+        "tgt_mask": torch.stack([t["tgt_mask"] for t in flat]),
+        "has_tgt": torch.tensor([t["has_tgt"] for t in flat], dtype=torch.bool),
+        "opt_mask": torch.stack([t["opt_mask"] for t in flat]),
+        "has_opt": torch.tensor([t["has_opt"] for t in flat], dtype=torch.bool),
+        "old_log_prob": old_log_prob,
+        "advantages": advantages,
+        "returns": torch.tensor(ret_list, dtype=torch.float32),
+    }
+
+    if ref_model is not None and cfg.kl_coef > 0:
+        batch["ref_log_prob"] = _compute_ref_log_probs_batched(
+            ref_model,
+            batch,
+            chunk_size=cfg.ref_eval_batch_size,
+            device=device,
+        )
+    else:
+        batch["ref_log_prob"] = old_log_prob.clone()
+
+    return batch, len(flat)
+
+
 def collect_ppo_rollouts(
     model: StrongholdPolicyNet,
     *,
@@ -125,8 +195,13 @@ def collect_ppo_rollouts(
     ppo_cfg: PPOConfig | None = None,
     device: torch.device | str = "cpu",
     catalog: GameCatalog | None = None,
+    pool: AsyncActorPool | None = None,
+    use_async_pool: bool = True,
+    min_batch: int = 0,
+    batch_timeout_ms: float = 2.0,
+    sampling_temperature: float = 1.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    """Run parallel solo rollouts with batched GPU inference and batched BC ref log-prob evaluation."""
+    """Run parallel solo rollouts via AsyncActorPool (or sync RoomPool fallback) + batched GPU inference."""
     cfg = ppo_cfg if ppo_cfg is not None else PPOConfig()
     cat = catalog if catalog is not None else get_catalog()
     model.eval()
@@ -134,13 +209,48 @@ def collect_ppo_rollouts(
         ref_model.eval()
 
     t0 = time.perf_counter()
+    n_workers = max(1, min(num_workers, num_episodes))
+
+    if pool is not None or (use_async_pool and n_workers >= 2):
+        def _run_with_pool(active_pool: AsyncActorPool) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
+            return active_pool.collect_ppo_episodes(
+                model,
+                num_episodes=num_episodes,
+                modes=modes,
+                seed_start=seed_start,
+                step_penalty=cfg.step_penalty,
+                round_survive_bonus=cfg.round_survive_bonus,
+                lp_loss_penalty=cfg.lp_loss_penalty,
+                victory_reward=cfg.victory_reward,
+                defeat_reward=cfg.defeat_reward,
+                max_prep_steps_per_round=cfg.max_prep_steps_per_round,
+                sampling_temperature=sampling_temperature,
+                min_batch=min_batch if min_batch > 0 else None,
+                batch_timeout_ms=batch_timeout_ms,
+                device=device,
+            )
+
+        if pool is not None:
+            ep_dicts, ep_stats = _run_with_pool(pool)
+        else:
+            with AsyncActorPool(
+                num_workers=n_workers,
+                min_batch=min_batch,
+                batch_timeout_ms=batch_timeout_ms,
+            ) as tmp_pool:
+                ep_dicts, ep_stats = _run_with_pool(tmp_pool)
+
+        batch, n_trans = _finalize_ppo_batch(ep_dicts, cfg=cfg, ref_model=ref_model, device=device)
+        ep_stats["transitions"] = n_trans
+        ep_stats["elapsed_sec"] = round(time.perf_counter() - t0, 2)
+        return batch, ep_stats
+
     all_episodes: list[list[_Transition]] = []
     wins = 0
     rounds_passed: list[int] = []
     forced_readies = 0
 
-    n_workers = max(1, min(num_workers, num_episodes))
-    with RoomPool(num_workers=n_workers) as pool:
+    with RoomPool(num_workers=n_workers) as sync_pool:
         next_ep = 0
         active_frames: dict[int, dict[str, Any]] = {}
         ep_buf: dict[int, list[_Transition]] = {}
@@ -164,7 +274,7 @@ def collect_ppo_rollouts(
             ep_prev_lp[w] = -1
             ep_prep_steps[w] = 0
             next_ep += 1
-        active_frames = pool.exchange(init_cmds)
+        active_frames = sync_pool.exchange(init_cmds)
 
         while active_frames:
             step_cmds: dict[int, dict[str, Any]] = {}
@@ -203,7 +313,12 @@ def collect_ppo_rollouts(
                     batch_encs.append(enc)
 
             if batch_encs:
-                acts = model.act_batch(batch_encs, deterministic=False, device=device)
+                acts = model.act_batch(
+                    batch_encs,
+                    deterministic=False,
+                    temperature=sampling_temperature,
+                    device=device,
+                )
                 for w, frame, enc, act in zip(batch_workers, batch_frames, batch_encs, acts):
                     a_type, a_src, a_tgt, a_opt = act["action_tuple"]
                     is_prep = frame["phase"] == "PREP"
@@ -231,7 +346,7 @@ def collect_ppo_rollouts(
                         "policy_version": 0,
                     }
 
-            replies = pool.exchange(step_cmds)
+            replies = sync_pool.exchange(step_cmds)
             reset_cmds: dict[int, dict[str, Any]] = {}
             next_active: dict[int, dict[str, Any]] = {}
 
@@ -256,72 +371,46 @@ def collect_ppo_rollouts(
                     next_active[w] = rep
 
             if reset_cmds:
-                next_active.update(pool.exchange(reset_cmds))
+                next_active.update(sync_pool.exchange(reset_cmds))
             active_frames = next_active
 
-    flat: list[_Transition] = []
-    adv_list: list[float] = []
-    ret_list: list[float] = []
-
-    for ep in all_episodes:
-        gae = 0.0
-        ep_adv = [0.0] * len(ep)
-        ep_ret = [0.0] * len(ep)
-        for i in range(len(ep) - 1, -1, -1):
-            tr = ep[i]
-            next_val = 0.0 if (i == len(ep) - 1 or tr.done) else ep[i + 1].value
-            non_term = 0.0 if tr.done else 1.0
-            delta = tr.reward + cfg.gamma * next_val * non_term - tr.value
-            gae = delta + cfg.gamma * cfg.gae_lambda * non_term * gae
-            ep_adv[i] = gae
-            ep_ret[i] = gae + tr.value
-        flat.extend(ep)
-        adv_list.extend(ep_adv)
-        ret_list.extend(ep_ret)
-
-    advantages = torch.tensor(adv_list, dtype=torch.float32)
-    if advantages.numel() > 1:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    old_log_prob = torch.tensor([t.old_log_prob for t in flat], dtype=torch.float32)
-    batch: dict[str, torch.Tensor] = {
-        "cat_ids": torch.stack([t.cat_ids for t in flat]),
-        "cont_feats": torch.stack([t.cont_feats for t in flat]),
-        "valid_mask": torch.stack([t.valid_mask for t in flat]),
-        "a_type": torch.tensor([t.a_type for t in flat], dtype=torch.long),
-        "a_src": torch.tensor([t.a_src for t in flat], dtype=torch.long),
-        "a_tgt": torch.tensor([t.a_tgt for t in flat], dtype=torch.long),
-        "a_opt": torch.tensor([t.a_opt for t in flat], dtype=torch.long),
-        "type_mask": torch.stack([t.masks.type_mask for t in flat]),
-        "src_mask": torch.stack([t.masks.src_mask for t in flat]),
-        "has_src": torch.tensor([t.masks.has_src for t in flat], dtype=torch.bool),
-        "band_mask": torch.stack([t.masks.band_mask for t in flat]),
-        "has_band": torch.tensor([t.masks.has_band for t in flat], dtype=torch.bool),
-        "tgt_mask": torch.stack([t.masks.tgt_mask for t in flat]),
-        "has_tgt": torch.tensor([t.masks.has_tgt for t in flat], dtype=torch.bool),
-        "opt_mask": torch.stack([t.masks.opt_mask for t in flat]),
-        "has_opt": torch.tensor([t.masks.has_opt for t in flat], dtype=torch.bool),
-        "old_log_prob": old_log_prob,
-        "advantages": advantages,
-        "returns": torch.tensor(ret_list, dtype=torch.float32),
-    }
-
-    if ref_model is not None and cfg.kl_coef > 0:
-        batch["ref_log_prob"] = _compute_ref_log_probs_batched(
-            ref_model,
-            batch,
-            chunk_size=cfg.ref_eval_batch_size,
-            device=device,
-        )
-    else:
-        batch["ref_log_prob"] = old_log_prob.clone()
-
+    ep_dicts_sync: list[list[dict[str, Any]]] = [
+        [
+            {
+                "cat_ids": t.cat_ids,
+                "cont_feats": t.cont_feats,
+                "valid_mask": t.valid_mask,
+                "a_type": t.a_type,
+                "a_src": t.a_src,
+                "a_tgt": t.a_tgt,
+                "a_opt": t.a_opt,
+                "type_mask": t.masks.type_mask,
+                "src_mask": t.masks.src_mask,
+                "has_src": t.masks.has_src,
+                "band_mask": t.masks.band_mask,
+                "has_band": t.masks.has_band,
+                "tgt_mask": t.masks.tgt_mask,
+                "has_tgt": t.masks.has_tgt,
+                "opt_mask": t.masks.opt_mask,
+                "has_opt": t.masks.has_opt,
+                "old_log_prob": t.old_log_prob,
+                "value": t.value,
+                "reward": t.reward,
+                "done": t.done,
+                "round_end": False,
+            }
+            for t in ep
+        ]
+        for ep in all_episodes
+    ]
+    batch, n_trans = _finalize_ppo_batch(ep_dicts_sync, cfg=cfg, ref_model=ref_model, device=device)
     stats = {
         "episodes": len(all_episodes),
-        "transitions": len(flat),
+        "transitions": n_trans,
         "win_rate": wins / max(1, len(all_episodes)),
         "avg_rounds_passed": sum(rounds_passed) / max(1, len(rounds_passed)),
         "forced_readies": forced_readies,
+        "sim_errors": 0,
         "elapsed_sec": round(time.perf_counter() - t0, 2),
     }
     return batch, stats
@@ -445,6 +534,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--updates", type=int, default=60, help="Total PPO rollout+update iterations")
     parser.add_argument("--episodes-per-update", type=int, default=32)
     parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--min-batch", type=int, default=0, help="Async dynamic batch target size (0 = auto)")
+    parser.add_argument("--batch-timeout-ms", type=float, default=2.0, help="Async dynamic batch wait window (ms)")
+    parser.add_argument("--sync-rollout", action="store_true", help="Disable AsyncActorPool and use legacy RoomPool")
     parser.add_argument("--lr", type=float, default=3e-5, help="Actor + backbone LR")
     parser.add_argument("--critic-lr", type=float, default=2e-4, help="Critic warm-up LR")
     parser.add_argument("--critic-warmup", type=int, default=3, help="Initial updates training value_head only")
@@ -498,6 +590,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     best_score = (-1.0, -1.0)  # (win_rate, avg_rounds_passed)
     best_out = args.best_out or str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
 
+    actor_pool: AsyncActorPool | None = (
+        AsyncActorPool(
+            num_workers=args.workers,
+            min_batch=args.min_batch,
+            batch_timeout_ms=args.batch_timeout_ms,
+        )
+        if not args.sync_rollout
+        else None
+    )
+
     def _run_eval(label: str, upd: int) -> None:
         nonlocal best_score
         if args.eval_episodes <= 0:
@@ -512,6 +614,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             break_cycles=not args.no_break_cycles,
             device=device,
             catalog=cat,
+            pool=actor_pool,
+            use_async_pool=not args.sync_rollout,
+            min_batch=args.min_batch,
+            batch_timeout_ms=args.batch_timeout_ms,
         )
         print(f"[{label}] live eval: {json.dumps(ev, ensure_ascii=False)}", flush=True)
         score = (float(ev["win_rate"]), float(ev["avg_rounds_passed"]))
@@ -520,50 +626,61 @@ def main(argv: Sequence[str] | None = None) -> None:
             save_checkpoint(model, best_out, extra={"update": upd, "eval": ev, "device": device})
             print(f"[{label}] new best checkpoint -> {best_out} (win={score[0]*100:.1f}%, rounds={score[1]:.2f})", flush=True)
 
-    # Baseline eval before PPO updates
-    _run_eval("INIT", 0)
+    try:
+        # Baseline eval before PPO updates
+        _run_eval("INIT", 0)
 
-    for upd in range(1, args.updates + 1):
-        is_warmup = upd <= warmup
-        rollout, r_stats = collect_ppo_rollouts(
-            model,
-            ref_model=ref_model,
-            num_episodes=args.episodes_per_update,
-            modes=SOLO_TIER1_MODES,
-            seed_start=args.seed + (upd - 1) * args.episodes_per_update,
-            num_workers=args.workers,
-            ppo_cfg=ppo_cfg,
-            device=device,
-            catalog=cat,
-        )
-        u_stats = ppo_update(
-            model,
-            critic_opt if is_warmup else full_opt,
-            rollout,
-            cfg=ppo_cfg,
-            critic_only=is_warmup,
-            device=device,
-        )
-        tag = f"WARMUP {upd:02d}/{warmup:02d}" if is_warmup else f"PPO {upd:02d}/{args.updates:02d}"
-        stop_flag = " [KL-STOP]" if u_stats["early_stopped"] > 0 else ""
-        print(
-            f"[{tag}] "
-            f"win={r_stats['win_rate']*100:.1f}% rounds={r_stats['avg_rounds_passed']:.2f} "
-            f"steps={r_stats['transitions']} forced_rdy={r_stats['forced_readies']} ({r_stats['elapsed_sec']:.1f}s) | "
-            f"ploss={u_stats['policy_loss']:.4f} vloss={u_stats['value_loss']:.4f} "
-            f"ent={u_stats['entropy']:.3f} akl={u_stats['approx_kl']:.4f} "
-            f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{stop_flag}",
-            flush=True,
-        )
+        for upd in range(1, args.updates + 1):
+            is_warmup = upd <= warmup
+            rollout, r_stats = collect_ppo_rollouts(
+                model,
+                ref_model=ref_model,
+                num_episodes=args.episodes_per_update,
+                modes=SOLO_TIER1_MODES,
+                seed_start=args.seed + (upd - 1) * args.episodes_per_update,
+                num_workers=args.workers,
+                ppo_cfg=ppo_cfg,
+                device=device,
+                catalog=cat,
+                pool=actor_pool,
+                use_async_pool=not args.sync_rollout,
+                min_batch=args.min_batch,
+                batch_timeout_ms=args.batch_timeout_ms,
+            )
+            u_stats = ppo_update(
+                model,
+                critic_opt if is_warmup else full_opt,
+                rollout,
+                cfg=ppo_cfg,
+                critic_only=is_warmup,
+                device=device,
+            )
+            tag = f"WARMUP {upd:02d}/{warmup:02d}" if is_warmup else f"PPO {upd:02d}/{args.updates:02d}"
+            stop_flag = " [KL-STOP]" if u_stats["early_stopped"] > 0 else ""
+            bs_info = f" bs={r_stats['avg_batch_size']:.1f}" if "avg_batch_size" in r_stats else ""
+            err_info = f" sim_err={r_stats['sim_errors']}" if r_stats.get("sim_errors", 0) > 0 else ""
+            print(
+                f"[{tag}] "
+                f"win={r_stats['win_rate']*100:.1f}% rounds={r_stats['avg_rounds_passed']:.2f} "
+                f"steps={r_stats['transitions']} forced_rdy={r_stats['forced_readies']}{bs_info}{err_info} "
+                f"({r_stats['elapsed_sec']:.1f}s) | "
+                f"ploss={u_stats['policy_loss']:.4f} vloss={u_stats['value_loss']:.4f} "
+                f"ent={u_stats['entropy']:.3f} akl={u_stats['approx_kl']:.4f} "
+                f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{stop_flag}",
+                flush=True,
+            )
 
-        if args.save_every > 0 and upd % args.save_every == 0:
-            save_checkpoint(model, args.out, extra={"update": upd, "device": device})
-        if args.eval_every > 0 and upd % args.eval_every == 0:
-            _run_eval(f"EVAL@{upd:02d}", upd)
+            if args.save_every > 0 and upd % args.save_every == 0:
+                save_checkpoint(model, args.out, extra={"update": upd, "device": device})
+            if args.eval_every > 0 and upd % args.eval_every == 0:
+                _run_eval(f"EVAL@{upd:02d}", upd)
 
-    save_checkpoint(model, args.out, extra={"update": args.updates, "device": device})
-    if args.eval_every <= 0 or args.updates % args.eval_every != 0:
-        _run_eval("FINAL", args.updates)
+        save_checkpoint(model, args.out, extra={"update": args.updates, "device": device})
+        if args.eval_every <= 0 or args.updates % args.eval_every != 0:
+            _run_eval("FINAL", args.updates)
+    finally:
+        if actor_pool is not None:
+            actor_pool.close()
 
 
 if __name__ == "__main__":
