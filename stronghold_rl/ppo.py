@@ -101,10 +101,17 @@ def build_curriculum_episode_modes(
     target_modes: Sequence[str],
     mix_modes: Sequence[str] = (),
     mix_ratio: float = 0.0,
+    *,
+    mix_offset: int = 0,
+    target_offset: int = 0,
 ) -> list[str]:
-    """Build an interleaved per-episode mode list mixing `mix_ratio` anchor modes into `target_modes`."""
+    """Build an interleaved per-episode mode list mixing `mix_ratio` anchor modes into `target_modes`.
+
+    Passing cumulative `mix_offset` / `target_offset` across updates guarantees exact uniform
+    coverage of every mode even when `n_mix < len(mix_modes)` or `n_tgt % len(target_modes) != 0`.
+    """
     if not mix_modes or mix_ratio <= 0.0:
-        return [target_modes[i % len(target_modes)] for i in range(num_episodes)]
+        return [target_modes[(target_offset + i) % len(target_modes)] for i in range(num_episodes)]
     n_mix = min(num_episodes, max(0, int(round(num_episodes * min(1.0, mix_ratio)))))
     n_tgt = num_episodes - n_mix
     out: list[str] = []
@@ -114,13 +121,13 @@ def build_curriculum_episode_modes(
         # Bresenham-style even interleaving
         want_mix = n_mix > 0 and ((i + 1) * n_mix // num_episodes) > (i * n_mix // num_episodes)
         if want_mix and mi < n_mix:
-            out.append(mix_modes[mi % len(mix_modes)])
+            out.append(mix_modes[(mix_offset + mi) % len(mix_modes)])
             mi += 1
         elif ti < n_tgt:
-            out.append(target_modes[ti % len(target_modes)])
+            out.append(target_modes[(target_offset + ti) % len(target_modes)])
             ti += 1
         else:
-            out.append(mix_modes[mi % len(mix_modes)])
+            out.append(mix_modes[(mix_offset + mi) % len(mix_modes)])
             mi += 1
     return out
 
@@ -784,6 +791,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     total_rl_updates = max(1, args.updates - warmup)
     mix_anneal_span = args.mix_anneal_updates if args.mix_anneal_updates > 0 else total_rl_updates
+    mix_cursor = 0
+    tgt_cursor = 0
 
     try:
         # Baseline eval before PPO updates
@@ -818,7 +827,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 modes,
                 mix_modes=mix_modes,
                 mix_ratio=cur_mix,
+                mix_offset=mix_cursor,
+                target_offset=tgt_cursor,
             )
+            n_mix_cur = (
+                min(args.episodes_per_update, max(0, int(round(args.episodes_per_update * min(1.0, cur_mix)))))
+                if (mix_modes and cur_mix > 0.0)
+                else 0
+            )
+            mix_cursor += n_mix_cur
+            tgt_cursor += args.episodes_per_update - n_mix_cur
 
             rollout, r_stats = collect_ppo_rollouts(
                 model,

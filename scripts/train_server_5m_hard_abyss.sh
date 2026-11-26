@@ -77,9 +77,11 @@ HARD_ENT_COEF_END="${HARD_ENT_COEF_END:-0.001}"
 HARD_KL_COEF="${HARD_KL_COEF:-0.03}"
 HARD_KL_COEF_END="${HARD_KL_COEF_END:-0.002}"
 HARD_KL_ANNEAL_UPDATES="${HARD_KL_ANNEAL_UPDATES:-80}"
-HARD_MIX_RATIO_START="${HARD_MIX_RATIO_START:-0.15}"
-HARD_MIX_RATIO_END="${HARD_MIX_RATIO_END:-0.0}"
-HARD_MIX_ANNEAL_UPDATES="${HARD_MIX_ANNEAL_UPDATES:-30}"
+# Replay ALL earlier levels (1-4 FUNNY + 5-8 NORMAL): 20% -> 8% permanent floor (~10 eps/upd across L1..L8)
+HARD_MIX_MODES="${HARD_MIX_MODES:-1-8}"
+HARD_MIX_RATIO_START="${HARD_MIX_RATIO_START:-0.20}"
+HARD_MIX_RATIO_END="${HARD_MIX_RATIO_END:-0.08}"
+HARD_MIX_ANNEAL_UPDATES="${HARD_MIX_ANNEAL_UPDATES:-40}"
 HARD_ROUND_SURVIVE_BONUS="${HARD_ROUND_SURVIVE_BONUS:-0.04}"
 HARD_HIDDEN_CLEAR_BONUS="${HARD_HIDDEN_CLEAR_BONUS:-0.6}"
 HARD_SEED="${HARD_SEED:-400000}"
@@ -98,9 +100,12 @@ ABYSS_ENT_COEF_END="${ABYSS_ENT_COEF_END:-0.0005}"
 ABYSS_KL_COEF="${ABYSS_KL_COEF:-0.03}"
 ABYSS_KL_COEF_END="${ABYSS_KL_COEF_END:-0.001}"
 ABYSS_KL_ANNEAL_UPDATES="${ABYSS_KL_ANNEAL_UPDATES:-120}"
-ABYSS_MIX_RATIO_START="${ABYSS_MIX_RATIO_START:-0.30}"
-ABYSS_MIX_RATIO_END="${ABYSS_MIX_RATIO_END:-0.0}"
-ABYSS_MIX_ANNEAL_UPDATES="${ABYSS_MIX_ANNEAL_UPDATES:-100}"
+# Replay ALL earlier levels (1-4 FUNNY + 5-8 NORMAL + 9-14 HARD): 35% -> 12% permanent floor
+# At 12% of 120 eps = 14 eps/upd -> literally 1 episode of EVERY level L1..L14 + 106 episodes of ABYSS L15..L20!
+ABYSS_MIX_MODES="${ABYSS_MIX_MODES:-1-14}"
+ABYSS_MIX_RATIO_START="${ABYSS_MIX_RATIO_START:-0.35}"
+ABYSS_MIX_RATIO_END="${ABYSS_MIX_RATIO_END:-0.12}"
+ABYSS_MIX_ANNEAL_UPDATES="${ABYSS_MIX_ANNEAL_UPDATES:-120}"
 ABYSS_ROUND_SURVIVE_BONUS="${ABYSS_ROUND_SURVIVE_BONUS:-0.05}"
 ABYSS_HIDDEN_CLEAR_BONUS="${ABYSS_HIDDEN_CLEAR_BONUS:-0.8}"
 ABYSS_SEED="${ABYSS_SEED:-600000}"
@@ -121,11 +126,11 @@ LOG_FILE="${LOG_FILE:-logs/train_5m_hard_abyss_${STAGE}_${TS}.log}"
 run_hard() {
   local init_ckpt="${HARD_INIT_CKPT:-${T2_BEST_CKPT}}"
   echo ">>> [1/2] Stage 1: Pure-PPO Curriculum on HARD (mode_single_9..14, ${HARD_UPDATES} upd x ${PPO_EPISODES_PER_UPDATE} eps)..."
-  echo "    init_ckpt=${init_ckpt} | kl=${HARD_KL_COEF}->${HARD_KL_COEF_END} (${HARD_KL_ANNEAL_UPDATES}u) | mix(tier2)=${HARD_MIX_RATIO_START}->${HARD_MIX_RATIO_END} (${HARD_MIX_ANNEAL_UPDATES}u)"
+  echo "    init_ckpt=${init_ckpt} | kl=${HARD_KL_COEF}->${HARD_KL_COEF_END} (${HARD_KL_ANNEAL_UPDATES}u) | mix(${HARD_MIX_MODES})=${HARD_MIX_RATIO_START}->${HARD_MIX_RATIO_END} (${HARD_MIX_ANNEAL_UPDATES}u)"
   "${PYTHON_BIN}" -u -m stronghold_rl.ppo \
     --modes tier3 \
     --eval-modes tier3 \
-    --mix-modes tier2 \
+    --mix-modes "${HARD_MIX_MODES}" \
     --mix-ratio-start "${HARD_MIX_RATIO_START}" \
     --mix-ratio-end "${HARD_MIX_RATIO_END}" \
     --mix-anneal-updates "${HARD_MIX_ANNEAL_UPDATES}" \
@@ -175,11 +180,11 @@ run_abyss() {
     init_ckpt="${T2_BEST_CKPT}"
   fi
   echo ">>> [2/2] Stage 2: Pure-PPO Curriculum on ABYSS (mode_single_15..20, ${ABYSS_UPDATES} upd x ${PPO_EPISODES_PER_UPDATE} eps)..."
-  echo "    init_ckpt=${init_ckpt} | kl=${ABYSS_KL_COEF}->${ABYSS_KL_COEF_END} (${ABYSS_KL_ANNEAL_UPDATES}u) | mix(tier3)=${ABYSS_MIX_RATIO_START}->${ABYSS_MIX_RATIO_END} (${ABYSS_MIX_ANNEAL_UPDATES}u)"
+  echo "    init_ckpt=${init_ckpt} | kl=${ABYSS_KL_COEF}->${ABYSS_KL_COEF_END} (${ABYSS_KL_ANNEAL_UPDATES}u) | mix(${ABYSS_MIX_MODES})=${ABYSS_MIX_RATIO_START}->${ABYSS_MIX_RATIO_END} (${ABYSS_MIX_ANNEAL_UPDATES}u)"
   "${PYTHON_BIN}" -u -m stronghold_rl.ppo \
     --modes tier4 \
     --eval-modes tier4 \
-    --mix-modes tier3 \
+    --mix-modes "${ABYSS_MIX_MODES}" \
     --mix-ratio-start "${ABYSS_MIX_RATIO_START}" \
     --mix-ratio-end "${ABYSS_MIX_RATIO_END}" \
     --mix-anneal-updates "${ABYSS_MIX_ANNEAL_UPDATES}" \

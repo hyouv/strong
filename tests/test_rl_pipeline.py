@@ -322,6 +322,20 @@ def test_curriculum_modes_round_discount_and_tier2_codec() -> None:
     assert sum(1 for m in mixed if m in SOLO_TIER1_MODES) == 3
     assert sum(1 for m in mixed if m in SOLO_TIER2_MODES) == 7
 
+    # Rotating mix_offset guarantees uniform coverage across 1-14 even when n_mix < 14
+    earlier = parse_solo_modes("1-14")
+    abyss = parse_solo_modes("15-20")
+    assert len(earlier) == 14 and len(abyss) == 6
+    seen_mix: list[str] = []
+    cur = 0
+    for _ in range(2):
+        ep_m = build_curriculum_episode_modes(120, abyss, mix_modes=earlier, mix_ratio=0.08, mix_offset=cur)
+        m_items = [m for m in ep_m if m in earlier]
+        assert len(m_items) == 10
+        seen_mix.extend(m_items)
+        cur += len(m_items)
+    assert set(seen_mix) == set(earlier)
+
     # Verify round-boundary discounting: within-round steps get gamma_intra=1.0, round boundary gets gamma_round=0.9
     dummy_t = lambda r, v, done, rnd_end: {
         "cat_ids": torch.zeros((NUM_TOKENS, NUM_CAT_FIELDS), dtype=torch.long),
