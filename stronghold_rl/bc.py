@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn as nn
 
-from stronghold_sim import RoomPool, SOLO_TIER1_MODES
+from stronghold_sim import RoomPool, SOLO_TIER1_MODES, parse_solo_modes
 
 from .catalog import GameCatalog, get_catalog
 from .codec import (
@@ -156,6 +156,30 @@ class BCDataset:
     def load(cls, path: str | Path) -> BCDataset:
         raw = torch.load(path, map_location="cpu", weights_only=True)
         return cls(**raw)
+
+
+def merge_bc_datasets(
+    primary: BCDataset,
+    aux: BCDataset,
+    *,
+    aux_ratio: float,
+    seed: int = 0,
+) -> BCDataset:
+    """Prepend a subsampled slice of `aux` before `primary` so tail validation stays purely on `primary`."""
+    if aux_ratio <= 0.0 or len(aux) == 0:
+        return primary
+    if aux_ratio >= 1.0:
+        raise ValueError(f"aux_ratio must be in [0, 1), got {aux_ratio}")
+    target_aux = min(len(aux), max(1, int(round(len(primary) * aux_ratio / (1.0 - aux_ratio)))))
+    g = torch.Generator()
+    g.manual_seed(seed)
+    perm = torch.randperm(len(aux), generator=g)[:target_aux]
+    fields = tuple(primary.__dataclass_fields__.keys())
+    merged = {
+        k: torch.cat([getattr(aux, k)[perm], getattr(primary, k)], dim=0)
+        for k in fields
+    }
+    return BCDataset(**merged)
 
 
 def _encode_replay_bytes(payload: tuple[bytes, float]) -> bytes | None:
@@ -844,7 +868,12 @@ def load_checkpoint(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Generate solo expert data and run BC cold-start training.")
+    parser = argparse.ArgumentParser(description="Generate solo expert data and run BC cold-start / bridge training.")
+    parser.add_argument("--modes", type=str, default="tier1", help="Solo modes preset (tier1, tier2, 5-8) or comma list")
+    parser.add_argument("--eval-modes", type=str, default="", help="Optional eval modes (defaults to --modes)")
+    parser.add_argument("--init-ckpt", type=str, default="", help="Optional checkpoint to warm-start BC fine-tuning")
+    parser.add_argument("--mix-dataset-cache", type=str, default="", help="Optional auxiliary BCDataset cache for replay mixing")
+    parser.add_argument("--mix-ratio", type=float, default=0.0, help="Fraction of auxiliary replay transitions (0..0.5)")
     parser.add_argument("--episodes", type=int, default=160, help="Number of solo expert matches to generate")
     parser.add_argument("--workers", type=int, default=8, help="Parallel JS simulator workers")
     parser.add_argument("--encode-workers", type=int, default=0, help="Parallel CPU encoders (0 = match --workers)")
@@ -871,18 +900,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--eval-only", type=str, default="", help="Skip training and evaluate this checkpoint path")
     args = parser.parse_args(argv)
 
+    modes = parse_solo_modes(args.modes)
+    eval_modes = parse_solo_modes(args.eval_modes) if args.eval_modes else modes
     device = resolve_device(args.device)
-    print(f"Using device: {describe_device(device)}", flush=True)
+    print(f"Using device: {describe_device(device)} | modes={modes}", flush=True)
     cat = get_catalog()
     eval_workers = args.eval_workers if args.eval_workers > 0 else args.workers
 
     if args.eval_only:
-        model, _ = load_checkpoint(args.eval_only, catalog=cat, device=device)
+        model, _ = load_checkpoint(args.eval_only, catalog=cat, device=device, dropout_override=0.0)
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Loaded {args.eval_only} ({n_params:,} params, cfg={model.cfg})", flush=True)
         ev = evaluate_policy_solo(
             model,
-            modes=SOLO_TIER1_MODES,
+            modes=eval_modes,
             seeds=[args.eval_seed_start + i for i in range(args.eval_episodes)],
             num_workers=eval_workers,
             deterministic=(args.eval_temp <= 0.0),
@@ -902,7 +933,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         enc_w = args.encode_workers if args.encode_workers > 0 else args.workers
         dataset, stats = collect_solo_expert_dataset(
             num_episodes=args.episodes,
-            modes=SOLO_TIER1_MODES,
+            modes=modes,
             seed_start=args.seed,
             num_workers=args.workers,
             encode_workers=enc_w,
@@ -914,16 +945,32 @@ def main(argv: Sequence[str] | None = None) -> None:
             dataset.save(cache_path)
             print(f"Saved dataset cache to {cache_path}", flush=True)
 
-    cfg = PolicyConfig(
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dim_ff=args.dim_ff,
-        dropout=args.dropout,
-    )
-    model = StrongholdPolicyNet(catalog=cat, config=cfg)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model config: {cfg} -> {n_params:,} params ({n_params/1e6:.2f}M)", flush=True)
+    if args.mix_dataset_cache and args.mix_ratio > 0.0:
+        aux_ds = BCDataset.load(args.mix_dataset_cache)
+        orig_len = len(dataset)
+        dataset = merge_bc_datasets(dataset, aux_ds, aux_ratio=args.mix_ratio, seed=args.seed)
+        print(
+            f"Mixed auxiliary dataset {args.mix_dataset_cache} (ratio={args.mix_ratio:.2f}): "
+            f"{orig_len} -> {len(dataset)} transitions (tail validation stays on primary modes)",
+            flush=True,
+        )
+
+    if args.init_ckpt:
+        model, _ = load_checkpoint(args.init_ckpt, catalog=cat, device=device, dropout_override=args.dropout)
+        cfg = model.cfg
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"Warm-started BC from {args.init_ckpt} ({n_params:,} params, cfg={cfg})", flush=True)
+    else:
+        cfg = PolicyConfig(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dim_ff=args.dim_ff,
+            dropout=args.dropout,
+        )
+        model = StrongholdPolicyNet(catalog=cat, config=cfg)
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"Model config: {cfg} -> {n_params:,} params ({n_params/1e6:.2f}M)", flush=True)
 
     t_train = time.perf_counter()
     history = train_bc(
@@ -942,14 +989,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     save_checkpoint(
         model,
         args.out,
-        extra={"bc_last": history[-1] if history else {}, "device": device, "n_params": n_params},
+        extra={
+            "bc_last": history[-1] if history else {},
+            "device": device,
+            "n_params": n_params,
+            "modes": list(modes),
+            "init_ckpt": args.init_ckpt,
+        },
     )
     print(f"Saved BC checkpoint to {args.out}", flush=True)
 
     if args.eval_episodes > 0:
         ev = evaluate_policy_solo(
             model,
-            modes=SOLO_TIER1_MODES,
+            modes=eval_modes,
             seeds=[args.eval_seed_start + i for i in range(args.eval_episodes)],
             num_workers=eval_workers,
             deterministic=(args.eval_temp <= 0.0),

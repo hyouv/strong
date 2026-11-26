@@ -36,6 +36,9 @@ from .codec import (
     NUM_CAT_FIELDS,
     NUM_TOKENS,
     TEMP_OFFSET,
+    TYPE_BAND,
+    TYPE_BAND_SKIP,
+    TYPE_BOND_GROUP,
     TYPE_CHOICE,
     TYPE_COMMAND_CHOICE,
     TYPE_DESTROY,
@@ -47,6 +50,16 @@ from .codec import (
     encode_frame,
 )
 from .model import StrongholdPolicyNet
+
+STRATEGIC_ACTION_TYPES: frozenset[int] = frozenset(
+    {
+        TYPE_BOND_GROUP,
+        TYPE_BAND,
+        TYPE_BAND_SKIP,
+        TYPE_CHOICE,
+        TYPE_COMMAND_CHOICE,
+    }
+)
 
 
 def _align64(n: int) -> int:
@@ -540,6 +553,8 @@ class AsyncActorPool:
         lp_loss_penalty: float,
         victory_reward: float,
         defeat_reward: float,
+        hidden_clear_bonus: float = 0.0,
+        episode_modes: Sequence[str] | None = None,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
         min_batch: int | None = None,
@@ -565,6 +580,7 @@ class AsyncActorPool:
         all_episodes: list[list[dict[str, Any]]] = []
         ep_buf: dict[int, list[dict[str, Any]]] = {}
         wins = 0
+        hidden_clears = 0
         rounds_passed: list[int] = []
         forced_readies = 0
         sim_errors = 0
@@ -576,6 +592,7 @@ class AsyncActorPool:
         completed_target = int(num_episodes)
         in_progress_target = 0
         inflight: set[int] = set()
+        mode_schedule = episode_modes if episode_modes else modes
 
         def _assign_episode(slot: int, *, is_retry: bool = False) -> None:
             nonlocal next_ep_id, retry_offset, in_progress_target
@@ -588,7 +605,7 @@ class AsyncActorPool:
                 retry_offset += 1
             else:
                 seed_idx = ep_id
-            mode_id = modes[seed_idx % len(modes)]
+            mode_id = mode_schedule[seed_idx % len(mode_schedule)]
             seed = seed_start + seed_idx
             ep_buf[slot] = []
             in_progress_target += 1
@@ -609,11 +626,14 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, _ep_id, win, rnds, _last_rnd, _steps, f_delta, _c_delta, r_delta, lp_lost, _to = ev
+                    _, slot, _ep_id, win, rnds, last_rnd, _steps, f_delta, _c_delta, r_delta, lp_lost, _to = ev
                     forced_readies += f_delta
                     in_progress_target -= 1
+                    hid_cleared = bool(win and rnds > last_rnd)
                     if win:
                         wins += 1
+                    if hid_cleared:
+                        hidden_clears += 1
                     rounds_passed.append(rnds)
                     buf = ep_buf.pop(slot, [])
                     if buf:
@@ -621,6 +641,8 @@ class AsyncActorPool:
                             buf[-1]["reward"] += round_survive_bonus * r_delta + lp_loss_penalty * lp_lost
                             buf[-1]["round_end"] = True
                         buf[-1]["reward"] += victory_reward if win else defeat_reward
+                        if hid_cleared and hidden_clear_bonus != 0.0:
+                            buf[-1]["reward"] += hidden_clear_bonus
                         buf[-1]["done"] = True
                         all_episodes.append(buf)
                     _assign_episode(slot)
@@ -701,12 +723,14 @@ class AsyncActorPool:
                         "reward": step_penalty if ob.is_prep else 0.0,
                         "done": False,
                         "round_end": False,
+                        "is_strategic": (not ob.is_prep) or (a_type in STRATEGIC_ACTION_TYPES),
                     }
                 )
 
         stats = {
             "episodes": len(all_episodes),
             "win_rate": wins / max(1, len(all_episodes)),
+            "hidden_clears": hidden_clears,
             "avg_rounds_passed": sum(rounds_passed) / max(1, len(rounds_passed)),
             "forced_readies": forced_readies,
             "sim_errors": sim_errors,
@@ -762,6 +786,7 @@ class AsyncActorPool:
         }
 
         wins = 0
+        hidden_clears = 0
         ok_eps = 0
         sim_errors = 0
         rounds_list: list[int] = []
@@ -798,12 +823,14 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, _ep_id, win, rnds, _last_rnd, steps, f_delta, c_delta, _r_d, _lp_l, _to = ev
+                    _, slot, _ep_id, win, rnds, last_rnd, steps, f_delta, c_delta, _r_d, _lp_l, _to = ev
                     ok_eps += 1
                     forced_readies += f_delta
                     cycle_breaks += c_delta
                     if win:
                         wins += 1
+                    if win and rnds > last_rnd:
+                        hidden_clears += 1
                     rounds_list.append(rnds)
                     steps_list.append(steps)
                     _assign_next(slot)
@@ -865,6 +892,8 @@ class AsyncActorPool:
             "episodes": ok_eps,
             "episodes_requested": total_eps,
             "win_rate": wins / max(1, ok_eps),
+            "hidden_clears": hidden_clears,
+            "hidden_clear_rate": hidden_clears / max(1, ok_eps),
             "avg_rounds_passed": sum(rounds_list) / max(1, len(rounds_list)),
             "avg_steps": sum(steps_list) / max(1, len(steps_list)),
             "forced_readies": forced_readies,

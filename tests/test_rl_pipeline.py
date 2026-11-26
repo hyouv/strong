@@ -9,11 +9,12 @@ from pathlib import Path
 
 import torch
 
-from stronghold_sim import RoomClient, SOLO_TIER1_MODES
+from stronghold_sim import RoomClient, SOLO_TIER1_MODES, SOLO_TIER2_MODES, parse_solo_modes
 from stronghold_rl.bc import (
     collect_solo_expert_dataset,
     evaluate_policy_solo,
     load_checkpoint,
+    merge_bc_datasets,
     save_checkpoint,
     train_bc,
 )
@@ -38,7 +39,13 @@ from stronghold_rl.codec import (
     encode_frame,
 )
 from stronghold_rl.model import PolicyConfig, StrongholdPolicyNet
-from stronghold_rl.ppo import PPOConfig, collect_ppo_rollouts, ppo_update
+from stronghold_rl.ppo import (
+    PPOConfig,
+    _finalize_ppo_batch,
+    build_curriculum_episode_modes,
+    collect_ppo_rollouts,
+    ppo_update,
+)
 from stronghold_rl.rollout import AsyncActorPool
 
 
@@ -292,3 +299,89 @@ def test_async_actor_pool_rollout_and_eval_parity() -> None:
         )
         assert ev_cb["episodes"] == 2
         assert ev_cb["sim_errors"] == 0
+
+
+def test_curriculum_modes_round_discount_and_tier2_codec() -> None:
+    """Verify mode parsing, curriculum mixing, round-boundary discounting, and mode_single_5..8 codec/rollout."""
+    assert parse_solo_modes("tier1") == SOLO_TIER1_MODES
+    assert parse_solo_modes("5-8") == SOLO_TIER2_MODES
+    assert parse_solo_modes("tier2") == SOLO_TIER2_MODES
+    assert parse_solo_modes("5,7") == ("mode_single_5", "mode_single_7")
+
+    mixed = build_curriculum_episode_modes(10, SOLO_TIER2_MODES, mix_modes=SOLO_TIER1_MODES, mix_ratio=0.3)
+    assert len(mixed) == 10
+    assert sum(1 for m in mixed if m in SOLO_TIER1_MODES) == 3
+    assert sum(1 for m in mixed if m in SOLO_TIER2_MODES) == 7
+
+    # Verify round-boundary discounting: within-round steps get gamma_intra=1.0, round boundary gets gamma_round=0.9
+    dummy_t = lambda r, v, done, rnd_end: {
+        "cat_ids": torch.zeros((NUM_TOKENS, NUM_CAT_FIELDS), dtype=torch.long),
+        "cont_feats": torch.zeros((NUM_TOKENS, CONT_DIM), dtype=torch.float32),
+        "valid_mask": torch.ones(NUM_TOKENS, dtype=torch.bool),
+        "a_type": 0,
+        "a_src": -1,
+        "a_tgt": -1,
+        "a_opt": -1,
+        "type_mask": torch.ones(19, dtype=torch.bool),
+        "src_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
+        "has_src": False,
+        "band_mask": torch.zeros(61, dtype=torch.bool),
+        "has_band": False,
+        "tgt_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
+        "has_tgt": False,
+        "opt_mask": torch.zeros(4, dtype=torch.bool),
+        "has_opt": False,
+        "is_strategic": False,
+        "old_log_prob": -0.5,
+        "value": v,
+        "reward": r,
+        "done": done,
+        "round_end": rnd_end,
+    }
+    ep = [
+        dummy_t(0.0, 0.0, False, False),  # intra-round step -> gamma=1.0
+        dummy_t(0.0, 0.0, False, True),   # round boundary   -> gamma=0.9
+        dummy_t(1.0, 0.0, True, False),   # terminal reward  -> 1.0
+    ]
+    cfg = PPOConfig(gamma_intra=1.0, gamma_round=0.9, gae_lambda=1.0, kl_coef=0.0)
+    batch, n_tr = _finalize_ppo_batch([ep], cfg=cfg, ref_model=None, device="cpu")
+    assert n_tr == 3
+    # Step 2 return = 1.0; Step 1 return = 0.9 * 1.0 = 0.9; Step 0 return = 1.0 * 0.9 = 0.9 (no intra-round decay!)
+    assert abs(float(batch["returns"][2]) - 1.0) < 1e-5
+    assert abs(float(batch["returns"][1]) - 0.9) < 1e-5
+    assert abs(float(batch["returns"][0]) - 0.9) < 1e-5
+
+    # Verify tier-2 (mode_single_5..8) codec + rollout + strategic entropy multiplier end-to-end
+    cat = get_catalog()
+    model = StrongholdPolicyNet(catalog=cat, config=PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128))
+    ppo_cfg = PPOConfig(
+        gamma_intra=1.0,
+        gamma_round=0.97,
+        strategic_ent_mult=2.5,
+        hidden_clear_bonus=0.5,
+        max_prep_steps_per_round=25,
+        kl_coef=0.0,
+    )
+    rollout, r_stats = collect_ppo_rollouts(
+        model,
+        num_episodes=2,
+        modes=SOLO_TIER2_MODES,
+        seed_start=31000,
+        num_workers=2,
+        ppo_cfg=ppo_cfg,
+        catalog=cat,
+    )
+    assert r_stats["episodes"] == 2
+    assert r_stats["transitions"] > 20
+    assert bool(rollout["is_strategic"].any())
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    u_stats = ppo_update(model, opt, rollout, cfg=ppo_cfg)
+    assert u_stats["strategic_entropy"] >= 0.0
+    assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())
+
+    # Verify merge_bc_datasets keeps primary tail intact
+    ds_primary, _ = collect_solo_expert_dataset(num_episodes=1, modes=("mode_single_5",), seed_start=32000, num_workers=1, catalog=cat)
+    ds_aux, _ = collect_solo_expert_dataset(num_episodes=1, modes=("mode_single_1",), seed_start=32001, num_workers=1, catalog=cat)
+    merged = merge_bc_datasets(ds_primary, ds_aux, aux_ratio=0.2, seed=0)
+    assert len(merged) > len(ds_primary)
+    assert torch.equal(merged.a_type[-len(ds_primary):], ds_primary.a_type)

@@ -7,10 +7,15 @@ from .protocol import (
     ROOT,
     SEATS_PER_COOP_GAME,
     SOLO_MODES,
+    SOLO_MODE_PRESETS,
     SOLO_TIER1_MODES,
+    SOLO_TIER2_MODES,
+    SOLO_TIER3_MODES,
+    SOLO_TIER4_MODES,
     WORKER_SCRIPT,
     expected_source,
     load_regulation_config,
+    parse_solo_modes,
 )
 from .runtime import find_node, physical_first_cpus
 from .worker import RoomClient, RoomPool, WorkerError
@@ -23,7 +28,11 @@ __all__ = [
     "ROOT",
     "SEATS_PER_COOP_GAME",
     "SOLO_MODES",
+    "SOLO_MODE_PRESETS",
     "SOLO_TIER1_MODES",
+    "SOLO_TIER2_MODES",
+    "SOLO_TIER3_MODES",
+    "SOLO_TIER4_MODES",
     "WORKER_SCRIPT",
     "RoomClient",
     "RoomPool",
@@ -31,5 +40,6 @@ __all__ = [
     "expected_source",
     "find_node",
     "load_regulation_config",
+    "parse_solo_modes",
     "physical_first_cpus",
 ]
