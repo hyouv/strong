@@ -290,6 +290,9 @@ def test_async_actor_pool_rollout_and_eval_parity() -> None:
         assert ev_async["avg_steps"] == ev_sync["avg_steps"]
         assert ev_async["forced_readies"] == ev_sync["forced_readies"]
         assert ev_async["cycle_breaks"] == 0
+        assert set(ev_async["by_mode"].keys()) == {"mode_single_1", "mode_single_2"}
+        assert ev_async["by_mode"]["mode_single_1"]["episodes"] == 1
+        assert ev_async["by_mode"]["mode_single_2"]["episodes"] == 1
 
         # Also exercise cycle-breaking path in AsyncActorPool
         ev_cb = evaluate_policy_solo(

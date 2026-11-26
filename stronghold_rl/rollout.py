@@ -770,6 +770,8 @@ class AsyncActorPool:
         cycle_breaks = 0
         num_gpu_batches = 0
         total_gpu_items = 0
+        ep_mode: dict[int, str] = {}
+        mode_acc: dict[str, list[int]] = {}  # mode_id -> [ok, wins, hidden_clears, rounds_sum]
 
         next_idx = 0
         inflight: set[int] = set()
@@ -782,6 +784,7 @@ class AsyncActorPool:
             next_idx += 1
             mode_id = modes[idx % len(modes)]
             seed = int(seeds[idx])
+            ep_mode[idx] = mode_id
             inflight.add(slot)
             self._conns[slot].send(("reset", idx, mode_id, seed, ep_cfg))
 
@@ -798,14 +801,22 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, _ep_id, win, rnds, last_rnd, steps, f_delta, c_delta, _r_d, _lp_l, _to = ev
+                    _, slot, done_ep_id, win, rnds, last_rnd, steps, f_delta, c_delta, _r_d, _lp_l, _to = ev
                     ok_eps += 1
                     forced_readies += f_delta
                     cycle_breaks += c_delta
                     if win:
                         wins += 1
-                    if win and rnds > last_rnd:
+                    hid_ok = bool(win and rnds > last_rnd)
+                    if hid_ok:
                         hidden_clears += 1
+                    m_id = ep_mode.get(done_ep_id)
+                    if m_id is not None:
+                        acc = mode_acc.setdefault(m_id, [0, 0, 0, 0])
+                        acc[0] += 1
+                        acc[1] += int(bool(win))
+                        acc[2] += int(hid_ok)
+                        acc[3] += int(rnds)
                     rounds_list.append(rnds)
                     steps_list.append(steps)
                     _assign_next(slot)
@@ -863,6 +874,17 @@ class AsyncActorPool:
                         )
                     )
 
+        by_mode: dict[str, dict[str, Any]] = {}
+        for m_id in dict.fromkeys(modes):
+            acc = mode_acc.get(m_id)
+            if acc and acc[0] > 0:
+                by_mode[m_id] = {
+                    "episodes": acc[0],
+                    "win_rate": round(acc[1] / acc[0], 4),
+                    "hidden_clears": acc[2],
+                    "avg_rounds": round(acc[3] / acc[0], 2),
+                }
+
         return {
             "episodes": ok_eps,
             "episodes_requested": total_eps,
@@ -876,4 +898,5 @@ class AsyncActorPool:
             "sim_errors": sim_errors,
             "avg_batch_size": round(total_gpu_items / max(1, num_gpu_batches), 2),
             "elapsed_sec": round(time.perf_counter() - t0, 2),
+            "by_mode": by_mode,
         }

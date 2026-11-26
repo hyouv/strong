@@ -654,6 +654,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--opt-ent-weight", type=float, default=0.15, help="Non-strategic step-4 facing/replace-slot entropy weight")
     parser.add_argument("--kl-coef", type=float, default=0.05, help="Initial KL anchor penalty to reference checkpoint")
     parser.add_argument("--kl-coef-end", type=float, default=-1.0, help="Optional final KL coef for linear annealing (<0 disables)")
+    parser.add_argument("--kl-anneal-updates", type=int, default=0, help="Post-warmup updates over which kl_coef anneals (0=all)")
     parser.add_argument("--target-kl", type=float, default=0.05)
     parser.add_argument("--minibatch-size", type=int, default=512)
     parser.add_argument("--gamma", type=float, default=0.995, help="Step-wise discount factor (used when --round-discount is off)")
@@ -803,7 +804,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cur_lr = _schedule_cosine(args.lr, args.lr_end, prog) if args.lr_end >= 0.0 else args.lr
                 cur_ent = _schedule_linear(args.ent_coef, args.ent_coef_end, prog) if args.ent_coef_end >= 0.0 else args.ent_coef
                 if ref_model is not None:
-                    cur_kl = _schedule_linear(args.kl_coef, args.kl_coef_end, prog) if args.kl_coef_end >= 0.0 else args.kl_coef
+                    kl_prog = min(1.0, rl_step / max(1, args.kl_anneal_updates)) if args.kl_anneal_updates > 0 else prog
+                    cur_kl = _schedule_linear(args.kl_coef, args.kl_coef_end, kl_prog) if args.kl_coef_end >= 0.0 else args.kl_coef
                 else:
                     cur_kl = 0.0
                 for pg in full_opt.param_groups:
