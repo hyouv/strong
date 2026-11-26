@@ -17,7 +17,7 @@ try {
 
       let reply = null;
       if (q.op === 'reset') {
-        reply = session.reset(q.seed, q.modeId, q.policy_version);
+        reply = session.reset(q.seed, q.modeId, q.policy_version, !!q.compact);
         reply.policy_version = session.policyVersion;
       } else if (q.op === 'step') {
         reply = session.step(q);

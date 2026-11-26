@@ -14,6 +14,11 @@ import subprocess
 import threading
 from typing import Any, BinaryIO, Mapping, Sequence
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional fast JSON accelerator
+    _orjson = None
+
 import psutil
 
 from .protocol import COOP_MODES, ROOT, SEATS_PER_COOP_GAME, WORKER_SCRIPT, expected_source
@@ -130,7 +135,10 @@ class RoomClient:
         if self._closed:
             raise WorkerError("Worker client is closed")
         assert self.process.stdin is not None and self.process.stdout is not None
-        payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+        if _orjson is not None:
+            payload = _orjson.dumps(msg) + b"\n"
+        else:
+            payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
         try:
             self.process.stdin.write(payload)
             self.process.stdin.flush()
@@ -146,7 +154,7 @@ class RoomClient:
                 f"JS worker exited unexpectedly (code={self.process.poll()})"
                 + self._stderr_summary()
             )
-        response = json.loads(line)
+        response = _orjson.loads(line) if _orjson is not None else json.loads(line)
         if not response.get("ok"):
             raise WorkerError(f"JS worker error: {response.get('error')}")
 
@@ -166,10 +174,14 @@ class RoomClient:
         seed: int,
         mode_id: str = COOP_MODES[0],
         policy_version: int | None = None,
+        *,
+        compact: bool = False,
     ) -> dict[str, Any]:
         req: dict[str, Any] = {"op": "reset", "seed": seed, "modeId": mode_id}
         if policy_version is not None:
             req["policy_version"] = policy_version
+        if compact:
+            req["compact"] = True
         return self.request(req)
 
     def step(

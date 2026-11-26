@@ -50,7 +50,7 @@ T1_DATA_CACHE="${T1_DATA_CACHE:-data/solo_t1_600ep.pt}"
 
 # ---- Stage A: Light Mixed-Tier BC Bridge (warms up 9 maps + 8 bonds + 40+ operators + R15 bosses) ----
 BRIDGE_EPISODES="${BRIDGE_EPISODES:-400}"
-BRIDGE_WORKERS="${BRIDGE_WORKERS:-32}"
+BRIDGE_WORKERS="${BRIDGE_WORKERS:-60}"
 BRIDGE_EPOCHS="${BRIDGE_EPOCHS:-8}"
 BRIDGE_BATCH_SIZE="${BRIDGE_BATCH_SIZE:-512}"
 BRIDGE_LR="${BRIDGE_LR:-2e-4}"
@@ -62,25 +62,26 @@ BRIDGE_CACHE="${BRIDGE_CACHE:-data/solo_t2_${BRIDGE_EPISODES}ep.pt}"
 BRIDGE_CKPT="${BRIDGE_CKPT:-checkpoints/bc_5m_solo_t2_bridge.pt}"
 
 # ---- Stage B: Exploration-Enhanced Masked PPO on mode_single_5..8 (~12h total budget) ---------------
-# Enabled by AsyncActorPool (8x faster): 64 episodes/update (~20k steps, ~54s/update on 64-core + 4090)
-# 750 updates x 64 eps = 48,000 episodes (~15M transitions) + 38 evals -> ~11.5 - 12.5 hours total
-PPO_UPDATES="${PPO_UPDATES:-750}"
-PPO_EPISODES_PER_UPDATE="${PPO_EPISODES_PER_UPDATE:-64}"
-PPO_WORKERS="${PPO_WORKERS:-32}"
-PPO_MIN_BATCH="${PPO_MIN_BATCH:-16}"
+# Enabled by P0+P1+P2 + NumPy static-template codec + orjson + 60 workers (~985 rollout steps/s):
+# 120 episodes/update (~34k-39k steps, ~50-58s/update incl. GPU backprop on 64-thread Xeon + 4090)
+# 720 updates x 120 eps = 86,400 episodes (~28M transitions) + 37 evals -> ~11.5 - 12.2 hours total
+PPO_UPDATES="${PPO_UPDATES:-720}"
+PPO_EPISODES_PER_UPDATE="${PPO_EPISODES_PER_UPDATE:-120}"
+PPO_WORKERS="${PPO_WORKERS:-60}"
+PPO_MIN_BATCH="${PPO_MIN_BATCH:-24}"
 PPO_BATCH_TIMEOUT_MS="${PPO_BATCH_TIMEOUT_MS:-2.0}"
 PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-512}"
 PPO_CRITIC_WARMUP="${PPO_CRITIC_WARMUP:-4}"
-PPO_LR="${PPO_LR:-4e-5}"
+PPO_LR="${PPO_LR:-5e-5}"
 PPO_LR_END="${PPO_LR_END:-5e-6}"
 PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-2}"
 
-# Smooth curriculum mixing: 25% Tier 1 -> 0% over first 60 post-warmup updates (~1h bridge)
+# Smooth curriculum mixing: 25% Tier 1 -> 0% over first 50 post-warmup updates (~45 min bridge)
 PPO_MIX_MODES="${PPO_MIX_MODES:-tier1}"
 PPO_MIX_RATIO_START="${PPO_MIX_RATIO_START:-0.25}"
 PPO_MIX_RATIO_END="${PPO_MIX_RATIO_END:-0.0}"
-PPO_MIX_ANNEAL_UPDATES="${PPO_MIX_ANNEAL_UPDATES:-60}"
+PPO_MIX_ANNEAL_UPDATES="${PPO_MIX_ANNEAL_UPDATES:-50}"
 
 # Exploration & gradual un-tethering from bot.js reference policy across the 12h run
 PPO_ENT_COEF="${PPO_ENT_COEF:-0.020}"
@@ -96,7 +97,7 @@ PPO_ROUND_SURVIVE_BONUS="${PPO_ROUND_SURVIVE_BONUS:-0.04}"
 PPO_VICTORY_REWARD="${PPO_VICTORY_REWARD:-1.5}"
 PPO_DEFEAT_REWARD="${PPO_DEFEAT_REWARD:--1.5}"
 PPO_HIDDEN_CLEAR_BONUS="${PPO_HIDDEN_CLEAR_BONUS:-0.5}"
-PPO_SEED="${PPO_SEED:-30000}"
+PPO_SEED="${PPO_SEED:-200000}"
 
 # ---- Evaluation & Artifacts -------------------------------------------------------------------------
 EVAL_EPISODES="${EVAL_EPISODES:-64}"

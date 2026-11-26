@@ -13,6 +13,11 @@ from pathlib import Path
 import time
 from typing import Any, Mapping, Sequence
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover
+    _orjson = None
+
 import torch
 import torch.nn as nn
 
@@ -191,8 +196,9 @@ def _encode_replay_bytes(payload: tuple[bytes, float]) -> bytes | None:
     replay_bytes, ep_return = payload
     torch.set_num_threads(1)
     cat = get_catalog()
+    loads = _orjson.loads if _orjson is not None else json.loads
     with gzip.GzipFile(fileobj=io.BytesIO(replay_bytes), mode="rb") as gz:
-        rows = [json.loads(line) for line in gz]
+        rows = [loads(line) for line in gz]
 
     cat_ids_list: list[torch.Tensor] = []
     cont_list: list[torch.Tensor] = []

@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from stronghold_sim import RoomClient, SOLO_TIER1_MODES, SOLO_TIER2_MODES, parse_solo_modes
@@ -37,6 +38,7 @@ from stronghold_rl.codec import (
     NUM_CAT_FIELDS,
     NUM_TOKENS,
     encode_frame,
+    encode_frame_into,
 )
 from stronghold_rl.model import PolicyConfig, StrongholdPolicyNet
 from stronghold_rl.ppo import (
@@ -385,3 +387,72 @@ def test_curriculum_modes_round_discount_and_tier2_codec() -> None:
     merged = merge_bc_datasets(ds_primary, ds_aux, aux_ratio=0.2, seed=0)
     assert len(merged) > len(ds_primary)
     assert torch.equal(merged.a_type[-len(ds_primary):], ds_primary.a_type)
+
+
+def test_compact_protocol_and_fast_codec_exact_parity() -> None:
+    """Compact JS protocol (`compact=True` + `cactions` + lossless unitStats cache) and zero-tensor
+    `encode_frame_into` must produce 100% bit-exact tensors and action masks vs full protocol."""
+    cat = get_catalog()
+    cat_buf = np.empty((NUM_TOKENS, NUM_CAT_FIELDS), dtype=np.int32)
+    cont_buf = np.empty((NUM_TOKENS, CONT_DIM), dtype=np.float32)
+    valid_buf = np.empty(NUM_TOKENS, dtype=np.bool_)
+
+    with RoomClient() as rc_full, RoomClient() as rc_comp:
+        f_full = rc_full.reset(seed=41234, mode_id="mode_single_5", policy_version=0, compact=False)
+        f_comp = rc_comp.reset(seed=41234, mode_id="mode_single_5", policy_version=0, compact=True)
+        steps = 0
+        prep_steps = 0
+        last_rnd = -1
+
+        while not f_full.get("terminal"):
+            assert not f_comp.get("terminal")
+            assert "cactions" in f_comp and "actions" not in f_comp
+            rnd = int(f_full["pub"].get("round") or 0)
+            if rnd != last_rnd:
+                last_rnd = rnd
+                prep_steps = 0
+
+            enc_full = encode_frame(f_full, cat, prep_steps=prep_steps)
+            enc_comp = encode_frame(f_comp, cat, prep_steps=prep_steps)
+            dec_into = encode_frame_into(f_comp, cat, cat_buf, cont_buf, valid_buf, prep_steps=prep_steps)
+
+            assert torch.equal(enc_full.cat_ids, enc_comp.cat_ids), f"cat_ids mismatch at step {steps}"
+            assert torch.equal(enc_full.cont_feats, enc_comp.cont_feats), f"cont_feats mismatch at step {steps}"
+            assert torch.equal(enc_full.valid_mask, enc_comp.valid_mask), f"valid_mask mismatch at step {steps}"
+            assert enc_full.action_tree.to_mask_spec() == enc_comp.action_tree.to_mask_spec()
+            assert enc_full.action_tree.key_to_tuple == enc_comp.action_tree.key_to_tuple
+            assert enc_full.action_tree.to_mask_spec() == dec_into.mask_spec
+            assert torch.equal(enc_full.cat_ids, torch.from_numpy(cat_buf.astype(np.int64)))
+            assert torch.equal(enc_full.cont_feats, torch.from_numpy(cont_buf))
+            assert torch.equal(enc_full.valid_mask, torch.from_numpy(valid_buf))
+
+            # Exercise freeze, buy, levelUp, move, equip, ready across a full match
+            acts = f_full["actions"]
+            if f_full["phase"] == "PREP":
+                prep_steps += 1
+                if prep_steps == 1:
+                    ak = next((i for i, a in enumerate(acts) if a["t"] == "g.freeze"), 0)
+                elif prep_steps >= 18:
+                    ak = next((i for i, a in enumerate(acts) if a["t"] == "g.ready"), 0)
+                else:
+                    ak = (
+                        next((i for i, a in enumerate(acts) if a["t"] == "g.equip"), None)
+                        or next((i for i, a in enumerate(acts) if a["t"] == "g.buy"), None)
+                        or next((i for i, a in enumerate(acts) if a["t"] == "g.levelUp"), None)
+                        or (steps * 7) % len(acts)
+                    )
+            else:
+                ak = steps % len(acts)
+
+            # Verify FastActionDecoder decodes the exact same action_key
+            tup = enc_full.action_tree.key_to_tuple[ak]
+            assert dec_into.decode(*tup) == ak
+
+            f_full = rc_full.step(f_full["decision_id"], ak, policy_version=0)
+            f_comp = rc_comp.step(f_comp["decision_id"], ak, policy_version=0)
+            steps += 1
+
+        assert f_comp.get("terminal") is True
+        assert f_comp.get("victory") == f_full.get("victory")
+        assert f_comp.get("roundsPassed") == f_full.get("roundsPassed")
+        assert steps > 50

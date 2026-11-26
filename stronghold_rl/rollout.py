@@ -35,19 +35,15 @@ from .codec import (
     CONT_DIM,
     NUM_CAT_FIELDS,
     NUM_TOKENS,
-    TEMP_OFFSET,
     TYPE_BAND,
     TYPE_BAND_SKIP,
     TYPE_BOND_GROUP,
     TYPE_CHOICE,
     TYPE_COMMAND_CHOICE,
-    TYPE_DESTROY,
     TYPE_READY,
-    TYPE_SELL,
     ActionMaskSpec,
-    ActionTree,
-    EncodedFrame,
-    encode_frame,
+    FastActionDecoder,
+    encode_frame_into,
 )
 from .model import StrongholdPolicyNet
 
@@ -104,35 +100,19 @@ def _make_shm_arrays(
     return cat_arr, cont_arr, valid_arr
 
 
-def _pick_force_unblock_action_local(enc: EncodedFrame) -> int:
-    tree = enc.action_tree
-    if tree.type_mask[TYPE_READY]:
-        return tree.decode(TYPE_READY)
-    for t in (TYPE_COMMAND_CHOICE, TYPE_CHOICE):
-        if tree.type_mask[t]:
-            src = tree.src_keys[t][0]
-            return tree.decode(t, src)
-    for t in (TYPE_DESTROY, TYPE_SELL):
-        if tree.type_mask[t]:
-            srcs = tree.src_keys[t]
-            temp_srcs = [s for s in srcs if TEMP_OFFSET <= s < TEMP_OFFSET + 5]
-            return tree.decode(t, temp_srcs[0] if temp_srcs else srcs[0])
-    return 0
-
-
 def _prep_state_signature_local(frame: Mapping[str, Any]) -> tuple[Any, ...]:
     own = frame["own"]
     shop = own.get("shop") or {}
     board = tuple(
         sorted(
-            (int(p["uid"]), int(p["row"]), int(p["col"]), p.get("dir", "RIGHT"), len(p.get("items") or []))
-            for p in (own.get("board") or [])
+            (int(p["uid"]), int(p["row"]), int(p["col"]), p.get("dir", "RIGHT"), len(p.get("items") or ()))
+            for p in (own.get("board") or ())
             if p
         )
     )
-    hand = tuple(int(p["uid"]) if p else None for p in (own.get("hand") or []))
-    temp = tuple(int(p["uid"]) if p else None for p in (own.get("temp") or []))
-    shop_sold = tuple(bool(s.get("sold")) if s else None for s in (shop.get("slots") or []))
+    hand = tuple(int(p["uid"]) if p else None for p in (own.get("hand") or ()))
+    temp = tuple(int(p["uid"]) if p else None for p in (own.get("temp") or ()))
+    shop_sold = tuple(bool(s.get("sold")) if s else None for s in (shop.get("slots") or ()))
     return (
         int(own.get("funds") or 0),
         int(shop.get("level") or 1),
@@ -150,7 +130,7 @@ def _actor_worker_main(
     shm_name: str,
     conn: Connection,
 ) -> None:
-    """Isolated actor worker process: owns 1 Node.js RoomClient + runs JSON decode + encode_frame."""
+    """Isolated actor worker process: owns 1 Node.js RoomClient (compact mode) + zero-tensor NumPy encode."""
     # Ensure worker processes never touch CUDA or oversubscribe CPU threads.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     torch.set_num_threads(1)
@@ -174,7 +154,7 @@ def _actor_worker_main(
         ep_prev_round = -1
         ep_prev_lp = -1
         ep_seen_sigs: dict[tuple[Any, ...], int] = {}
-        cur_tree: ActionTree | None = None
+        cur_dec: FastActionDecoder | None = None
         cur_decision_id = -1
         cur_phase = ""
         has_transition = False
@@ -188,7 +168,7 @@ def _actor_worker_main(
 
         def _advance_frame(frame: dict[str, Any]) -> None:
             nonlocal client, ep_steps, ep_prep_steps, ep_prev_round, ep_prev_lp
-            nonlocal cur_tree, cur_decision_id, cur_phase, has_transition
+            nonlocal cur_dec, cur_decision_id, cur_phase, has_transition
 
             pending_r_delta = 0
             pending_lp_lost = 0
@@ -197,7 +177,7 @@ def _actor_worker_main(
 
             while True:
                 if frame.get("terminal") or (max_total_steps > 0 and ep_steps >= max_total_steps):
-                    cur_tree = None
+                    cur_dec = None
                     conn.send(
                         (
                             "done",
@@ -232,12 +212,13 @@ def _actor_worker_main(
                 ep_prev_lp = lp
 
                 phase = frame["phase"]
-                enc = encode_frame(frame, catalog, prep_steps=ep_prep_steps)
+                # Encode directly into SharedMemory NumPy buffers (zero PyTorch Tensor allocation)
+                dec = encode_frame_into(frame, catalog, cat_slot, cont_slot, valid_slot, prep_steps=ep_prep_steps)
 
                 # Local fast-path 1: prep step limit guardrail (no GPU round-trip needed)
                 if phase == "PREP" and ep_prep_steps >= max_prep_steps:
                     forced_delta += 1
-                    action_key = _pick_force_unblock_action_local(enc)
+                    action_key = dec.pick_force_unblock_action()
                     ep_prep_steps += 1
                     ep_steps += 1
                     assert client is not None
@@ -252,9 +233,9 @@ def _actor_worker_main(
                     sig = _prep_state_signature_local(frame)
                     visits = ep_seen_sigs.get(sig, 0)
                     ep_seen_sigs[sig] = visits + 1
-                    if visits >= 2 and bool(enc.action_tree.type_mask[TYPE_READY]):
+                    if visits >= 2 and dec.mask_spec.type_mask_bytes[TYPE_READY]:
                         cycle_delta += 1
-                        action_key = enc.action_tree.decode(TYPE_READY)
+                        action_key = dec.decode(TYPE_READY)
                         ep_prep_steps += 1
                         ep_steps += 1
                         assert client is not None
@@ -265,15 +246,9 @@ def _actor_worker_main(
                         req_det = False
                         req_temp = max(base_temp, 0.6) if base_temp > 0.0 else 0.6
 
-                # Write encoded tensors into this worker's shared-memory row (zero FD passing)
-                np.copyto(cat_slot, enc.cat_ids.numpy(), casting="unsafe")
-                np.copyto(cont_slot, enc.cont_feats.numpy())
-                np.copyto(valid_slot, enc.valid_mask.numpy())
-
-                cur_tree = enc.action_tree
+                cur_dec = dec
                 cur_decision_id = int(frame["decision_id"])
                 cur_phase = phase
-                mask_spec = cur_tree.to_mask_spec()
 
                 conn.send(
                     (
@@ -287,7 +262,7 @@ def _actor_worker_main(
                         pending_lp_lost,
                         forced_delta,
                         cycle_delta,
-                        mask_spec,
+                        dec.mask_spec,
                     )
                 )
                 return
@@ -310,26 +285,26 @@ def _actor_worker_main(
                 ep_prev_round = -1
                 ep_prev_lp = -1
                 ep_seen_sigs.clear()
-                cur_tree = None
+                cur_dec = None
                 cur_decision_id = -1
                 cur_phase = ""
                 has_transition = False
                 try:
                     assert client is not None
-                    frame = client.reset(seed=int(seed), mode_id=str(mode_id), policy_version=0)
+                    frame = client.reset(seed=int(seed), mode_id=str(mode_id), policy_version=0, compact=True)
                     _advance_frame(frame)
                 except WorkerError as exc:
-                    cur_tree = None
+                    cur_dec = None
                     if client is not None:
                         client.close()
                     client = RoomClient()
                     conn.send(("error", slot, ep_id, str(exc)[:400]))
             elif op == "act":
                 _, req_ep_id, a_type, a_src, a_tgt, a_opt = cmd
-                if req_ep_id != ep_id or cur_tree is None:
+                if req_ep_id != ep_id or cur_dec is None:
                     raise RuntimeError(f"Actor slot {slot} stale act: ep {req_ep_id} != {ep_id}")
                 try:
-                    action_key = cur_tree.decode(a_type, a_src, a_tgt, a_opt)
+                    action_key = cur_dec.decode(a_type, a_src, a_tgt, a_opt)
                     has_transition = True
                     if cur_phase == "PREP":
                         ep_prep_steps += 1
@@ -338,7 +313,7 @@ def _actor_worker_main(
                     frame = client.step(cur_decision_id, action_key, policy_version=0)
                     _advance_frame(frame)
                 except WorkerError as exc:
-                    cur_tree = None
+                    cur_dec = None
                     if client is not None:
                         client.close()
                     client = RoomClient()
