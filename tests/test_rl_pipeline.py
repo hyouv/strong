@@ -138,18 +138,29 @@ def test_bc_cold_start_and_masked_ppo_smoke(tmp_path: Path) -> None:
     assert stats["episodes_kept"] == 4
     assert len(dataset) > 200
 
-    cfg = PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128)
+    cfg = PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128, dropout=0.1)
     model = StrongholdPolicyNet(catalog=cat, config=cfg)
 
-    history = train_bc(model, dataset, epochs=4, batch_size=64, lr=2e-3, val_ratio=0.15, verbose=False)
+    history = train_bc(
+        model,
+        dataset,
+        epochs=4,
+        batch_size=64,
+        lr=2e-3,
+        weight_decay=1e-2,
+        label_smoothing=0.05,
+        val_ratio=0.15,
+        verbose=False,
+    )
     assert history[-1]["policy_nll"] < history[0]["policy_nll"]
     assert history[-1]["type_acc"] > 0.55
     assert "val_nll" in history[-1] and "val_full_acc" in history[-1]
 
     ckpt = tmp_path / "bc_smoke.pt"
     save_checkpoint(model, ckpt, extra={"stats": stats})
-    loaded, extra = load_checkpoint(ckpt, catalog=cat)
+    loaded, extra = load_checkpoint(ckpt, catalog=cat, dropout_override=0.0)
     assert extra["stats"]["episodes_kept"] == 4
+    assert loaded.cfg.dropout == 0.0
 
     # Live solo evaluation after BC cold-start (with cycle-breaker)
     ev = evaluate_policy_solo(

@@ -469,9 +469,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     cat = get_catalog()
     if args.init_ckpt:
-        model, _ = load_checkpoint(args.init_ckpt, catalog=cat, device=device)
+        # Force dropout=0.0 in PPO so train() and eval() produce strictly identical policy ratios
+        model, _ = load_checkpoint(args.init_ckpt, catalog=cat, device=device, dropout_override=0.0)
         ref_path = args.ref_ckpt or args.init_ckpt
-        ref_model, _ = load_checkpoint(ref_path, catalog=cat, device=device)
+        ref_model, _ = load_checkpoint(ref_path, catalog=cat, device=device, dropout_override=0.0)
         for p in ref_model.parameters():
             p.requires_grad_(False)
         n_params = sum(p.numel() for p in model.parameters())

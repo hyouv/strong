@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import gzip
 import io
 import json
@@ -420,6 +420,23 @@ def _eval_bc_split(
     }
 
 
+def _build_adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Apply AdamW weight decay to 2D+ weight matrices while excluding biases and LayerNorm/1D params."""
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith(".bias") or "norm" in name.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def train_bc(
     model: StrongholdPolicyNet,
     dataset: BCDataset,
@@ -427,7 +444,8 @@ def train_bc(
     epochs: int = 10,
     batch_size: int = 64,
     lr: float = 1e-3,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 1e-2,
+    label_smoothing: float = 0.05,
     value_coef: float = 0.25,
     grad_clip: float = 1.0,
     val_ratio: float = 0.0,
@@ -437,12 +455,12 @@ def train_bc(
     seed: int = 0,
     verbose: bool = True,
 ) -> list[dict[str, float]]:
-    """Train policy + value critic via Behavior Cloning with optional contiguous tail validation split."""
+    """Train policy + value critic via Behavior Cloning with masked label smoothing & decoupled weight decay."""
     torch.manual_seed(seed)
     if str(device).startswith("cuda"):
         torch.set_float32_matmul_precision("high")
     model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW(_build_adamw_param_groups(model, weight_decay), lr=lr)
     sched = (
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=lr * 0.05)
         if cosine_lr and epochs > 1
@@ -485,9 +503,9 @@ def train_bc(
         for start in range(0, train_n, batch_size):
             idx = perm[start : start + batch_size]
             batch = dataset.slice(idx, device=device)
-            out = model.evaluate_batch(batch)
+            out = model.evaluate_batch(batch, label_smoothing=label_smoothing)
 
-            policy_loss = -out["log_prob"].mean()
+            policy_loss = out["bc_loss"].mean()
             value_loss = nn.functional.mse_loss(out["value"], batch["returns"])
             loss = policy_loss + value_coef * value_loss
 
@@ -498,7 +516,7 @@ def train_bc(
 
             bs = int(idx.shape[0])
             sum_loss += float(loss.item()) * bs
-            sum_ploss += float(policy_loss.item()) * bs
+            sum_ploss += float((-out["log_prob"].mean()).item()) * bs
             sum_vloss += float(value_loss.item()) * bs
 
             ok_type = out["pred_type"] == batch["a_type"]
@@ -778,9 +796,12 @@ def load_checkpoint(
     *,
     catalog: GameCatalog | None = None,
     device: torch.device | str = "cpu",
+    dropout_override: float | None = None,
 ) -> tuple[StrongholdPolicyNet, dict[str, Any]]:
     raw = torch.load(path, map_location=device, weights_only=True)
     cfg = PolicyConfig.from_dict(raw["config"])
+    if dropout_override is not None:
+        cfg = replace(cfg, dropout=float(dropout_override))
     model = StrongholdPolicyNet(catalog=catalog, config=cfg).to(device)
     model.load_state_dict(raw["state_dict"])
     return model, raw.get("extra", {})
@@ -794,13 +815,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--epochs", type=int, default=25, help="BC training epochs")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Contiguous tail validation split ratio")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=3)
     parser.add_argument("--dim-ff", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, or cuda:<idx>")
     parser.add_argument("--out", type=str, default="checkpoints/bc_solo_t1.pt")
@@ -875,6 +897,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        label_smoothing=args.label_smoothing,
         val_ratio=args.val_ratio,
         restore_best=args.val_ratio > 0.0,
         device=device,

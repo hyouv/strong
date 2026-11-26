@@ -49,7 +49,7 @@ D_MODEL="${D_MODEL:-256}"
 N_HEADS="${N_HEADS:-8}"
 N_LAYERS="${N_LAYERS:-6}"
 DIM_FF="${DIM_FF:-640}"
-DROPOUT="${DROPOUT:-0.0}"
+DROPOUT="${DROPOUT:-0.1}"
 
 # ---- Stage 1: Solo Tier 1-4 (8 core bonds) Expert Collection + BC ----------
 BC_EPISODES="${BC_EPISODES:-600}"
@@ -58,6 +58,8 @@ BC_ENCODE_WORKERS="${BC_ENCODE_WORKERS:-32}"
 BC_EPOCHS="${BC_EPOCHS:-30}"
 BC_BATCH_SIZE="${BC_BATCH_SIZE:-512}"
 BC_LR="${BC_LR:-8e-4}"
+BC_WEIGHT_DECAY="${BC_WEIGHT_DECAY:-1e-2}"
+BC_LABEL_SMOOTHING="${BC_LABEL_SMOOTHING:-0.05}"
 BC_VAL_RATIO="${BC_VAL_RATIO:-0.1}"
 BC_SEED="${BC_SEED:-1000}"
 
@@ -118,7 +120,7 @@ print(f'Parameter count: {n:,} ({n/1e6:.2f}M)')
 }
 
 run_bc() {
-  echo ">>> [Stage 1/2] Starting 5M BC cold-start (${BC_EPISODES} solo eps, ${BC_EPOCHS} epochs on ${DEVICE})..."
+  echo ">>> [Stage 1/2] Starting 5M BC cold-start (${BC_EPISODES} solo eps, ${BC_EPOCHS} epochs, wd=${BC_WEIGHT_DECAY}, ls=${BC_LABEL_SMOOTHING}, drop=${DROPOUT} on ${DEVICE})..."
   "${PYTHON_BIN}" -u -m stronghold_rl.bc \
     --episodes "${BC_EPISODES}" \
     --workers "${BC_WORKERS}" \
@@ -126,6 +128,8 @@ run_bc() {
     --epochs "${BC_EPOCHS}" \
     --batch-size "${BC_BATCH_SIZE}" \
     --lr "${BC_LR}" \
+    --weight-decay "${BC_WEIGHT_DECAY}" \
+    --label-smoothing "${BC_LABEL_SMOOTHING}" \
     --val-ratio "${BC_VAL_RATIO}" \
     --d-model "${D_MODEL}" \
     --n-heads "${N_HEADS}" \

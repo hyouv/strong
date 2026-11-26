@@ -131,6 +131,34 @@ def _masked_log_softmax_and_entropy(
     return log_probs, ent
 
 
+def _masked_smoothed_nll(
+    log_probs: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    label_smoothing: float,
+    active: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Exact label-smoothed NLL restricted strictly to legal (masked-in) options.
+
+    For each active row with K legal options:
+      loss = -(1 - eps) * log_p[target] - eps * (sum_{legal j} log_p[j]) / K
+    When K == 1 (forced move), both terms are 0. Inactive rows return exact 0.
+    """
+    B = log_probs.shape[0]
+    ar = torch.arange(B, device=log_probs.device)
+    nll_hard = -log_probs[ar, target]
+    if label_smoothing > 0.0:
+        legal_f = mask.to(log_probs.dtype)
+        legal_cnt = legal_f.sum(dim=-1).clamp(min=1.0)
+        mean_neg_lp = -(log_probs.clamp(min=-1e4) * legal_f).sum(dim=-1) / legal_cnt
+        loss = (1.0 - label_smoothing) * nll_hard + label_smoothing * mean_neg_lp
+    else:
+        loss = nll_hard
+    if active is not None:
+        loss = loss * active.to(loss.dtype)
+    return loss
+
+
 def _sample_from_logits(
     logits: torch.Tensor,
     mask: torch.Tensor,
@@ -199,6 +227,7 @@ class StrongholdPolicyNet(nn.Module):
             nn.Linear(d, d),
         )
         self.in_norm = nn.LayerNorm(d)
+        self.in_drop = nn.Dropout(cfg.dropout)
 
         # ---- Transformer encoder -------------------------------------------
         enc_layer = nn.TransformerEncoderLayer(
@@ -212,6 +241,7 @@ class StrongholdPolicyNet(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers, enable_nested_tensor=False)
         self.out_norm = nn.LayerNorm(d)
+        self.out_drop = nn.Dropout(cfg.dropout)
 
         # ---- Decoupled Critic Value Head (reads VALUE_CLS_IDX) -------------
         self.value_head = nn.Sequential(
@@ -271,9 +301,9 @@ class StrongholdPolicyNet(nn.Module):
         bond_prior = self.bond_prior_proj(self.entity_bond_table[cat_ids[:, :, CAT_ENTITY]])
         cont = self.cont_proj(cont_feats)
 
-        x = self.in_norm(seg + pos + ent + eq + band + bond + stage + direction + bond_prior + cont)
+        x = self.in_drop(self.in_norm(seg + pos + ent + eq + band + bond + stage + direction + bond_prior + cont))
         h = self.encoder(x, src_key_padding_mask=~valid_mask)
-        return self.out_norm(h)
+        return self.out_drop(self.out_norm(h))
 
     @torch.no_grad()
     def act_batch(
@@ -378,7 +408,12 @@ class StrongholdPolicyNet(nn.Module):
         """Autoregressively sample one legal composite action for a single EncodedFrame."""
         return self.act_batch([enc], deterministic=deterministic, temperature=temperature, device=device)[0]
 
-    def evaluate_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def evaluate_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        label_smoothing: float = 0.0,
+    ) -> dict[str, torch.Tensor]:
         """Fully vectorized evaluation of a batch of composite actions for BC & Masked PPO."""
         cat_ids = batch["cat_ids"]         # [B, N, 8]
         cont_feats = batch["cont_feats"]   # [B, N, CONT_DIM]
@@ -448,6 +483,16 @@ class StrongholdPolicyNet(nn.Module):
         joint_lp = lp_type + lp_src + lp_band + lp_tgt + lp_opt
         joint_ent = type_ent + src_ent + band_ent + tgt_ent + opt_ent
 
+        if label_smoothing > 0.0:
+            ls_type = _masked_smoothed_nll(type_lp_all, a_type, type_mask, label_smoothing)
+            ls_src = _masked_smoothed_nll(src_lp_all, safe_src, src_mask, label_smoothing, active=has_src)
+            ls_band = _masked_smoothed_nll(band_lp_all, safe_band, band_mask, label_smoothing, active=has_band)
+            ls_tgt = _masked_smoothed_nll(tgt_lp_all, safe_tgt, tgt_mask, label_smoothing, active=has_tgt)
+            ls_opt = _masked_smoothed_nll(opt_lp_all, safe_opt, opt_mask, label_smoothing, active=has_opt)
+            bc_loss = ls_type + ls_src + ls_band + ls_tgt + ls_opt
+        else:
+            bc_loss = -joint_lp
+
         pred_type = type_logits.masked_fill(~type_mask, -1e9).argmax(dim=-1)
         pred_src = src_logits.masked_fill(~src_mask, -1e9).argmax(dim=-1)
         pred_band = band_logits.masked_fill(~band_mask, -1e9).argmax(dim=-1)
@@ -456,6 +501,7 @@ class StrongholdPolicyNet(nn.Module):
 
         return {
             "log_prob": joint_lp,
+            "bc_loss": bc_loss,
             "entropy": joint_ent,
             "value": values,
             "lp_type": lp_type,
