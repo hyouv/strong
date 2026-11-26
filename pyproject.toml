@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stronghold-sim"
+version = "0.1.0"
+description = "Headless Stronghold Protocol (act3autochess@V3_1) game simulator and Python worker pool"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.10"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["stronghold_sim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

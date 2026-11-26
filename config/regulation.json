@@ -1,0 +1,46 @@
+{
+  "schema": "stronghold-training/1",
+  "target": "卫戍协议：规程·序列Ⅰ",
+  "version": "act3autochess@V3_1",
+  "source": {
+    "repository": "https://github.com/sganggs/Stronghold-Protocol",
+    "revision": "55f528e9fc4872388360ee85e13eca8594856204"
+  },
+  "out_of_match": {
+    "ownership": "all_available_operators",
+    "potential": 6,
+    "cultivate": 3,
+    "loadout_selection": "fixed_upstream_defaults",
+    "respect_mode_skill_and_module_caps": true,
+    "learn_out_of_match_choices": false
+  },
+  "curriculum": {
+    "mode": "solo",
+    "regulation_levels": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+    "initial_level": 1,
+    "cooperative_training": false
+  },
+  "simulation": {
+    "reference": "pinned_javascript_full_content",
+    "target_backends": ["cpp", "cuda"],
+    "unknown_mechanic": "reject_episode",
+    "internal_error": "quarantine_episode",
+    "native_training_requires_whole_match_parity": true,
+    "maximum_native_workers": 6,
+    "cuda_memory_budget_mib": 8192
+  },
+  "learning": {
+    "algorithm": "masked_ppo_then_search_distillation",
+    "observation": "player_visible_state_only",
+    "reward": "terminal_victory",
+    "gamma": 1.0,
+    "train_seed_start": 1000,
+    "evaluation_seed_start": 1000000,
+    "save_optimizer_and_rng": true,
+    "choose_opening_strategy": true,
+    "choose_active_command_and_target": true,
+    "choose_command_replacement": true,
+    "passive_effects": "automatic_environment_transitions",
+    "preserve_command_upgrade_cost_cooldown_and_usage_history": true
+  }
+}

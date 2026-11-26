@@ -1,0 +1,12 @@
+{
+  "name": "stronghold-protocol-engine",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "description": "Headless Stronghold Protocol (act3autochess@V3_1) core simulation engine extracted from sganggs/Stronghold-Protocol",
+  "upstream": {
+    "repository": "https://github.com/sganggs/Stronghold-Protocol",
+    "revision": "55f528e9fc4872388360ee85e13eca8594856204"
+  }
+}

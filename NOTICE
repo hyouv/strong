@@ -1,0 +1,10 @@
+This repository contains a headless Stronghold Protocol: Regulation (act3autochess@V3_1)
+game simulator migrated and refactored from stronghold-training.
+
+The core game engine under simulator/engine/ is derived unmodified from:
+  https://github.com/sganggs/Stronghold-Protocol
+  revision 55f528e9fc4872388360ee85e13eca8594856204
+
+Both the upstream reference implementation and this simulator are licensed under GPL-3.0-or-later.
+See LICENSE and simulator/engine/NOTICE.md for upstream attribution and asset notices.
+No official game binaries or media assets are included or required.
