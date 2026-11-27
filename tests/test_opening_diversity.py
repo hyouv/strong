@@ -276,6 +276,8 @@ def test_scratch_launcher_chains_fresh_weights_and_masks_from_warmup(tmp_path: P
     bc, *ppo_commands = commands
     assert bc[bc.index("-m") + 1] == "stronghold_rl.bc"
     assert "--init-ckpt" not in bc
+    assert bc[bc.index("--opening-policy") + 1] == "balanced"
+    assert bc[bc.index("--dataset-cache") + 1] == "data/v2feat_solo_1_8_1200ep_balanced_v1.pt"
     previous = bc[bc.index("--out") + 1]
     assert previous == "checkpoints/diversity_scratch_test_bc.pt"
     for stage, args in zip(("normal", "hard", "abyss"), ppo_commands):

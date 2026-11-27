@@ -24,6 +24,7 @@ import torch.nn as nn
 from stronghold_sim import RoomPool, SOLO_TIER1_MODES, parse_solo_modes
 
 from .catalog import GameCatalog, get_catalog
+from .bc_openings import BalancedOpeningSampler, bc_cache_metadata
 from .codec import (
     NO_ARG,
     TEMP_OFFSET,
@@ -149,12 +150,23 @@ class BCDataset:
     def save(self, path: str | Path) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.__dict__, p)
+        payload = {k: getattr(self, k) for k in self.__dataclass_fields__}
+        payload["_metadata"] = getattr(self, "_metadata", {})
+        torch.save(payload, p)
 
     @classmethod
-    def load(cls, path: str | Path) -> BCDataset:
+    def load(cls, path: str | Path, *, expected_metadata: Mapping[str, Any] | None = None) -> BCDataset:
         raw = torch.load(path, map_location="cpu", weights_only=True)
-        return cls(**raw)
+        metadata = raw.pop("_metadata", {})
+        if expected_metadata and any(metadata.get(k) != v for k, v in expected_metadata.items()):
+            raise ValueError(
+                f"BC cache {path} does not match the requested generation settings. "
+                "Use a new --dataset-cache path or remove the old cache to regenerate. "
+                f"Expected {dict(expected_metadata)}, got {metadata}"
+            )
+        dataset = cls(**raw)
+        dataset._metadata = metadata
+        return dataset
 
 
 def merge_bc_datasets(
@@ -290,9 +302,17 @@ def collect_solo_expert_dataset(
     only_victories: bool = False,
     verbose: bool = False,
     catalog: GameCatalog | None = None,
+    opening_policy: str = "balanced",
 ) -> tuple[BCDataset, dict[str, Any]]:
     """Generate solo expert replays in parallel via RoomPool and encode them across CPU processes."""
     _ = catalog if catalog is not None else get_catalog()
+    if opening_policy not in ("balanced", "legacy"):
+        raise ValueError("opening_policy must be balanced or legacy")
+    if num_episodes < 1 or not modes:
+        raise ValueError("At least one episode and mode are required")
+    if opening_policy == "balanced" and only_victories:
+        raise ValueError("Filtering victories would bias balanced opening coverage")
+    opening_sampler = BalancedOpeningSampler(seed_start) if opening_policy == "balanced" else None
     t0 = time.perf_counter()
 
     n_sim = max(1, min(num_workers, num_episodes))
@@ -326,6 +346,12 @@ def collect_solo_expert_dataset(
                         "memory_limit": 64 * 1024 * 1024,
                         "turn_order": "serial",
                     }
+                if opening_sampler is not None:
+                    options = pool.exchange({w: {
+                        "op": "expert_opening_options", "seed": cmd["seed"], "modeId": cmd["modeId"],
+                    } for w, cmd in cmds.items()})
+                    for w, cmd in cmds.items():
+                        cmd["opening"] = opening_sampler.choose(options[w]["options"], cmd["modeId"])
                 replies = pool.exchange(cmds)
                 ep += batch_n
 
@@ -367,13 +393,17 @@ def collect_solo_expert_dataset(
     fields = tuple(chunks[0].keys())
     merged = {k: torch.cat([c[k] for c in chunks], dim=0) for k in fields}
     dataset = BCDataset(**merged)
+    dataset._metadata = bc_cache_metadata(opening_policy, modes, num_episodes, seed_start)
     stats = {
         "episodes_total": total_episodes,
         "episodes_kept": kept_episodes,
         "expert_win_rate": victories / max(1, total_episodes),
         "transitions": len(dataset),
         "elapsed_sec": round(time.perf_counter() - t0, 2),
+        "opening_policy": dataset._metadata["opening_policy"],
+        "opening_coverage": opening_sampler.summary() if opening_sampler is not None else None,
     }
+    dataset._metadata["opening_coverage"] = stats["opening_coverage"]
     return dataset, stats
 
 
@@ -899,6 +929,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, or cuda:<idx>")
     parser.add_argument("--out", type=str, default="checkpoints/bc_solo_t1.pt")
     parser.add_argument("--dataset-cache", type=str, default="", help="Optional .pt path to save/load dataset")
+    parser.add_argument("--opening-policy", choices=("balanced", "legacy"), default="balanced",
+                        help="Balanced compatible opening coverage (default), or original expert choices")
     parser.add_argument("--eval-episodes", type=int, default=8)
     parser.add_argument("--eval-workers", type=int, default=0, help="Parallel eval workers (0 = match --workers)")
     parser.add_argument("--eval-seed-start", type=int, default=9000)
@@ -933,9 +965,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     cache_path = Path(args.dataset_cache) if args.dataset_cache else None
+    expected_cache = bc_cache_metadata(args.opening_policy, modes, args.episodes, args.seed)
     if cache_path and cache_path.is_file():
-        dataset = BCDataset.load(cache_path)
+        dataset = BCDataset.load(cache_path, expected_metadata=expected_cache if args.opening_policy == "balanced" else None)
         print(f"Loaded cached dataset: {len(dataset)} transitions from {cache_path}", flush=True)
+        print("BC cache metadata:", json.dumps(getattr(dataset, "_metadata", {}), ensure_ascii=False), flush=True)
     else:
         enc_w = args.encode_workers if args.encode_workers > 0 else args.workers
         dataset, stats = collect_solo_expert_dataset(
@@ -946,6 +980,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             encode_workers=enc_w,
             verbose=True,
             catalog=cat,
+            opening_policy=args.opening_policy,
         )
         print("Expert dataset collected:", json.dumps(stats, ensure_ascii=False), flush=True)
         if cache_path:
@@ -953,7 +988,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"Saved dataset cache to {cache_path}", flush=True)
 
     if args.mix_dataset_cache and args.mix_ratio > 0.0:
-        aux_ds = BCDataset.load(args.mix_dataset_cache)
+        aux_ds = BCDataset.load(args.mix_dataset_cache, expected_metadata=(
+            {"opening_policy": expected_cache["opening_policy"]} if args.opening_policy == "balanced" else None
+        ))
         orig_len = len(dataset)
         dataset = merge_bc_datasets(dataset, aux_ds, aux_ratio=args.mix_ratio, seed=args.seed)
         print(
@@ -1002,6 +1039,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "n_params": n_params,
             "modes": list(modes),
             "init_ckpt": args.init_ckpt,
+            "bc_data_config": expected_cache,
         },
     )
     print(f"Saved BC checkpoint to {args.out}", flush=True)

@@ -121,7 +121,8 @@ BC_WEIGHT_DECAY="${BC_WEIGHT_DECAY:-1e-2}"
 BC_LABEL_SMOOTHING="${BC_LABEL_SMOOTHING:-0.10}"  # softer opening logits prevent premature collapse in PPO
 BC_VAL_RATIO="${BC_VAL_RATIO:-0.1}"
 BC_SEED="${BC_SEED:-100000}"
-BC_DATASET_CACHE="${BC_DATASET_CACHE:-data/v2feat_solo_1_8_${BC_EPISODES}ep.pt}"
+BC_OPENING_POLICY="${BC_OPENING_POLICY:-balanced}"
+BC_DATASET_CACHE="${BC_DATASET_CACHE:-data/v2feat_solo_1_8_${BC_EPISODES}ep_${BC_OPENING_POLICY}_v1.pt}"
 BC_CKPT="${BC_CKPT:-checkpoints/v2feat_bc_5m_solo_1_8_${BC_EPISODES}ep.pt}"
 
 # ---- Stage 2: NORMAL Curriculum PPO (mode_single_5..8 + L1..4 replay) ------------------------------
@@ -228,6 +229,7 @@ preflight() {
   echo "  STRONGHOLD_NODE: ${STRONGHOLD_NODE:-<PATH>}"
   echo "  DEVICE         : ${DEVICE}"
   echo "  MODEL          : d=${D_MODEL}, heads=${N_HEADS}, layers=${N_LAYERS}, ff=${DIM_FF}, bc_drop=${DROPOUT}"
+  echo "  BC DATA        : opening=${BC_OPENING_POLICY}, cache=${BC_DATASET_CACHE}"
   echo "  ANTI-COLLAPSE  : unified 1-8 BC (ls=${BC_LABEL_SMOOTHING}), decoupled s_ent_c, gae_lambda_intra=${PPO_GAE_LAMBDA_INTRA}, target_kl=${PPO_TARGET_KL}"
   echo "  LOG_FILE       : ${LOG_FILE}"
   echo "========================================================================"
@@ -276,6 +278,7 @@ run_bc() {
     --seed "${BC_SEED}" \
     --device "${DEVICE}" \
     --dataset-cache "${BC_DATASET_CACHE}" \
+    --opening-policy "${BC_OPENING_POLICY}" \
     --out "${BC_CKPT}" \
     --eval-episodes "${NORMAL_EVAL_EPISODES}" \
     --eval-workers "${BC_WORKERS}" \

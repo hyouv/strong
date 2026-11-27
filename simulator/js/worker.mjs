@@ -4,6 +4,7 @@ import readline from 'node:readline';
 import { once } from 'node:events';
 import { RoomSession } from './session.mjs';
 import { writeExamples } from './examples.mjs';
+import { expertOpeningOptions } from './expert_openings.mjs';
 
 const session = new RoomSession();
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -23,9 +24,16 @@ try {
         reply = session.step(q);
         reply.policy_version = session.policyVersion;
       } else if (q.op === 'examples') {
-        reply = writeExamples(q.directory, q.modeId, q.seed, 0, q.turn_order);
+        reply = writeExamples(q.directory, q.modeId, q.seed, 0, q.turn_order, q.opening);
       } else if (q.op === 'examples_memory') {
-        reply = writeExamples(null, q.modeId, q.seed, q.memory_limit, q.turn_order);
+        reply = writeExamples(null, q.modeId, q.seed, q.memory_limit, q.turn_order, q.opening);
+      } else if (q.op === 'expert_opening_options') {
+        try {
+          session.reset(q.seed, q.modeId);
+          reply = { ok: true, options: expertOpeningOptions(session.match) };
+        } finally {
+          session.dispose();
+        }
       } else if (q.op === 'hello') {
         reply = session.hello();
       } else {

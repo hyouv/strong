@@ -10,6 +10,7 @@ cd "${ROOT_DIR}"
 STAGE="${1:-all}"
 export RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 export LOG_FILE="${LOG_FILE:-logs/diversity_scratch_${RUN_ID}_${STAGE}.log}"
+export BC_OPENING_POLICY="${BC_OPENING_POLICY:-balanced}"
 
 # Start at full curriculum strength, including critic warmup. Half of episodes
 # still have the full legal set so the policy learns unrestricted selection.
@@ -29,7 +30,7 @@ export ABYSS_CKPT="${ABYSS_CKPT:-checkpoints/diversity_scratch_${RUN_ID}_abyss_l
 export ABYSS_BEST_CKPT="${ABYSS_BEST_CKPT:-checkpoints/diversity_scratch_${RUN_ID}_abyss_best.pt}"
 
 # Deliberately replace inherited fine-tuning inputs with this run's stage chain.
-# BC itself creates a new model; the existing expert dataset cache can be reused.
+# BC creates a new model and accepts only a cache matching its generation metadata.
 export NORMAL_INIT_CKPT="${BC_CKPT}"
 export HARD_INIT_CKPT="${NORMAL_BEST_CKPT}"
 export ABYSS_INIT_CKPT="${HARD_BEST_CKPT}"

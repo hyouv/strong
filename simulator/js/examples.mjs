@@ -11,6 +11,7 @@ import { VirtualScheduler } from '../engine/server/match/scheduler.js';
 import { botPrepBeginSteps, botPrepEndSteps, botPickBand, botPickCard } from '../engine/server/match/bot.js';
 import { botPickBondGroup } from '../engine/server/match/botBondGroups.js';
 import { actionsFor } from './candidates.mjs';
+import { validateExpertOpening } from './expert_openings.mjs';
 
 const methods = {
   buy: (slot) => ({ t: 'g.buy', slot }),
@@ -56,7 +57,7 @@ function prepareRound(match, seats, turnOrder) {
   }
 }
 
-export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrder = 'serial') {
+export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrder = 'serial', opening = null) {
   if (!['serial', 'interleaved'].includes(turnOrder)) throw Error('Unknown teacher turn order');
   if (!ALL_MODES.includes(modeId) || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
     throw Error('Invalid demonstration request');
@@ -181,7 +182,10 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
   }
 
   try {
-    const provenance = turnOrder === 'interleaved' ? { turnOrder } : {};
+    const provenance = {
+      ...(turnOrder === 'interleaved' ? { turnOrder } : {}),
+      ...(opening ? { opening } : {}),
+    };
     write({
       kind: 'reference_expert',
       source,
@@ -193,6 +197,7 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
       ...provenance,
     });
     match.start();
+    validateExpertOpening(match, opening);
     const prepared = new Map();
     for (let guard = 0; !match.ended && guard < 200000; guard++) {
       const phase = match.phase;
@@ -202,7 +207,7 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
           if (match.bondChoice?.picked === null) {
             choose(ps, {
               t: 'g.bondGroup',
-              idx: botPickBondGroup(match, ps),
+              idx: opening ? opening.bondGroup : botPickBondGroup(match, ps),
               setupRevision: match.setupRevision,
             });
           }
@@ -212,10 +217,13 @@ export function writeExamples(directory, modeId, seed, memoryLimit = 0, turnOrde
       } else if (phase === 'BAND_DRAFT') {
         const ps = match.players.get(match.draftTurn());
         if (ps) {
-          let id = botPickBand(match, ps);
-          for (let i = 0; i < 8 && match.bandTaken(id, ps.playerId); i++) id = botPickBand(match, ps);
-          if (match.bandTaken(id, ps.playerId)) {
-            id = match.gd.bandIds().find((k) => match.gd.bandAllowed(k) && !match.bandTaken(k, ps.playerId));
+          let id = opening?.bandId;
+          if (!opening) {
+            id = botPickBand(match, ps);
+            for (let i = 0; i < 8 && match.bandTaken(id, ps.playerId); i++) id = botPickBand(match, ps);
+            if (match.bandTaken(id, ps.playerId)) {
+              id = match.gd.bandIds().find((k) => match.gd.bandAllowed(k) && !match.bandTaken(k, ps.playerId));
+            }
           }
           choose(ps, { t: 'g.band', bandId: id });
           continue;
