@@ -305,7 +305,7 @@ export class RoomSession {
           throw Error('Incomplete match');
         }
         this.frame = null;
-        return {
+        const out = {
           ok: true,
           terminal: true,
           modeId: this.modeId,
@@ -318,6 +318,21 @@ export class RoomSession {
           fields: this.collected,
           previous,
         };
+        if (this.compact) {
+          out.bossId = match.bossId ?? null;
+          let bossDmgRatio = 0;
+          if (out.victory) {
+            bossDmgRatio = 1;
+          } else if (
+            match.round >= match.gd.bossRound &&
+            match.bossPool &&
+            match.bossPool.maxHp > 0
+          ) {
+            bossDmgRatio = Math.max(0, Math.min(1, 1 - match.bossPool.hp / match.bossPool.maxHp));
+          }
+          out.bossDmgRatio = bossDmgRatio;
+        }
+        return out;
       }
       const ps = this._actor();
       if (!ps) {
@@ -397,7 +412,7 @@ export class RoomSession {
     throw Error('Scheduler failed to reach next decision');
   }
 
-  reset(seed, requestedMode, version = null, compact = false) {
+  reset(seed, requestedMode, version = null, compact = false, bossId = null) {
     if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) throw Error('Invalid seed');
     if (!ALL_MODES.includes(requestedMode)) throw Error('Invalid mode');
     if (version !== null && (!Number.isSafeInteger(version) || version < 0)) {
@@ -467,6 +482,13 @@ export class RoomSession {
       if (!r?.perPlayer || r.synthetic || r.errors) this.failures++;
       return collect(f, r);
     };
+    if (bossId != null && bossId !== '') {
+      const validBosses = this.match.gd.bossWeights(false).map(([id]) => id);
+      if (!validBosses.includes(bossId)) {
+        throw Error(`Invalid bossId ${bossId} for mode ${this.modeId}`);
+      }
+      this.match.bossId = bossId;
+    }
     this.match.start();
     return this._next();
   }

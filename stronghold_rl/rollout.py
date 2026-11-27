@@ -242,6 +242,8 @@ def _actor_worker_main(
                             pending_r_delta,
                             pending_lp_lost,
                             not bool(frame.get("terminal")),
+                            frame.get("bossId"),
+                            float(frame.get("bossDmgRatio") or 0.0),
                         )
                     )
                     return
@@ -341,7 +343,7 @@ def _actor_worker_main(
             if op == "close":
                 break
             if op == "reset":
-                _, ep_id, mode_id, seed, cfg = cmd
+                _, ep_id, mode_id, seed, cfg, boss_id = cmd
                 max_prep_steps = int(cfg["max_prep_steps"])
                 max_total_steps = int(cfg["max_total_steps"])
                 break_cycles = bool(cfg["break_cycles"])
@@ -361,7 +363,13 @@ def _actor_worker_main(
                 has_transition = False
                 try:
                     assert client is not None
-                    frame = client.reset(seed=int(seed), mode_id=str(mode_id), policy_version=0, compact=True)
+                    frame = client.reset(
+                        seed=int(seed),
+                        mode_id=str(mode_id),
+                        policy_version=0,
+                        compact=True,
+                        boss_id=boss_id,
+                    )
                     _advance_frame(frame)
                 except WorkerError as exc:
                     cur_dec = None
@@ -603,9 +611,11 @@ class AsyncActorPool:
         victory_reward: float,
         defeat_reward: float,
         hidden_clear_bonus: float = 0.0,
+        boss_dmg_defeat_bonus: float = 0.0,
         prep_timeout_penalty: float = 0.0,
         repeat_state_penalty: float = 0.0,
         episode_modes: Sequence[str] | None = None,
+        episode_bosses: Sequence[str | None] | None = None,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
         min_batch: int | None = None,
@@ -659,11 +669,12 @@ class AsyncActorPool:
             else:
                 seed_idx = ep_id
             mode_id = mode_schedule[seed_idx % len(mode_schedule)]
+            boss_id = episode_bosses[seed_idx % len(episode_bosses)] if episode_bosses else None
             seed = seed_start + seed_idx
             ep_buf[slot] = []
             in_progress_target += 1
             inflight.add(slot)
-            self._conns[slot].send(("reset", ep_id, mode_id, seed, ep_cfg))
+            self._conns[slot].send(("reset", ep_id, mode_id, seed, ep_cfg, boss_id))
 
         for w in range(min(self.num_workers, completed_target)):
             _assign_episode(w)
@@ -679,7 +690,24 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, _ep_id, win, rnds, last_rnd, _steps, f_delta, to_delta, rep_delta, _c_delta, r_delta, lp_lost, _to = ev
+                    (
+                        _,
+                        slot,
+                        _ep_id,
+                        win,
+                        rnds,
+                        last_rnd,
+                        _steps,
+                        f_delta,
+                        to_delta,
+                        rep_delta,
+                        _c_delta,
+                        r_delta,
+                        lp_lost,
+                        _to,
+                        _boss_id,
+                        boss_dmg_ratio,
+                    ) = ev
                     forced_readies += f_delta
                     repeat_states += rep_delta
                     in_progress_target -= 1
@@ -699,6 +727,8 @@ class AsyncActorPool:
                             buf[-1]["reward"] += round_survive_bonus * r_delta + lp_loss_penalty * lp_lost
                             buf[-1]["round_end"] = True
                         buf[-1]["reward"] += victory_reward if win else defeat_reward
+                        if (not win) and boss_dmg_defeat_bonus != 0.0 and boss_dmg_ratio > 0.0:
+                            buf[-1]["reward"] += boss_dmg_defeat_bonus * boss_dmg_ratio
                         if hid_cleared and hidden_clear_bonus != 0.0:
                             buf[-1]["reward"] += hidden_clear_bonus
                         buf[-1]["done"] = True
@@ -862,6 +892,7 @@ class AsyncActorPool:
         total_gpu_items = 0
         ep_mode: dict[int, str] = {}
         mode_acc: dict[str, list[int]] = {}  # mode_id -> [ok, wins, hidden_clears, rounds_sum]
+        boss_acc: dict[str, list[float]] = {}  # boss_id -> [ok, wins, boss_dmg_sum]
 
         next_idx = 0
         inflight: set[int] = set()
@@ -876,7 +907,7 @@ class AsyncActorPool:
             seed = int(seeds[idx])
             ep_mode[idx] = mode_id
             inflight.add(slot)
-            self._conns[slot].send(("reset", idx, mode_id, seed, ep_cfg))
+            self._conns[slot].send(("reset", idx, mode_id, seed, ep_cfg, None))
 
         for w in range(min(self.num_workers, total_eps)):
             _assign_next(w)
@@ -891,7 +922,24 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, done_ep_id, win, rnds, last_rnd, steps, f_delta, _to_d, _rep_d, c_delta, _r_d, _lp_l, _to = ev
+                    (
+                        _,
+                        slot,
+                        done_ep_id,
+                        win,
+                        rnds,
+                        last_rnd,
+                        steps,
+                        f_delta,
+                        _to_d,
+                        _rep_d,
+                        c_delta,
+                        _r_d,
+                        _lp_l,
+                        _to,
+                        boss_id,
+                        boss_dmg_ratio,
+                    ) = ev
                     ok_eps += 1
                     forced_readies += f_delta
                     cycle_breaks += c_delta
@@ -907,6 +955,11 @@ class AsyncActorPool:
                         acc[1] += int(bool(win))
                         acc[2] += int(hid_ok)
                         acc[3] += int(rnds)
+                    if boss_id:
+                        b_acc = boss_acc.setdefault(str(boss_id), [0.0, 0.0, 0.0])
+                        b_acc[0] += 1.0
+                        b_acc[1] += float(bool(win))
+                        b_acc[2] += float(boss_dmg_ratio)
                     rounds_list.append(rnds)
                     steps_list.append(steps)
                     _assign_next(slot)
@@ -975,6 +1028,17 @@ class AsyncActorPool:
                     "avg_rounds": round(acc[3] / acc[0], 2),
                 }
 
+        by_boss: dict[str, dict[str, Any]] = {}
+        for bid in sorted(boss_acc.keys()):
+            b_acc = boss_acc[bid]
+            cnt = int(b_acc[0])
+            if cnt > 0:
+                by_boss[bid] = {
+                    "episodes": cnt,
+                    "win_rate": round(b_acc[1] / cnt, 4),
+                    "avg_boss_dmg": round(b_acc[2] / cnt, 4),
+                }
+
         return {
             "episodes": ok_eps,
             "episodes_requested": total_eps,
@@ -989,4 +1053,5 @@ class AsyncActorPool:
             "avg_batch_size": round(total_gpu_items / max(1, num_gpu_batches), 2),
             "elapsed_sec": round(time.perf_counter() - t0, 2),
             "by_mode": by_mode,
+            "by_boss": by_boss,
         }

@@ -253,3 +253,31 @@ test('writeExamples produces valid compressed replay in memory', () => {
   assert.equal(lines.at(-1).terminal, true);
   assert.equal(lines.length, res.recorded + 2);
 });
+
+test('RoomSession compact mode reports bossId/bossDmgRatio and supports valid bossId override', () => {
+  const session = new RoomSession();
+  try {
+    let frame = session.reset(5555, 'mode_single_15', 0, true, 'boss_17');
+    assert.equal(frame.pub.bossId, 'boss_17');
+    assert.throws(() => session.reset(5555, 'mode_single_15', 0, true, 'boss_nonexistent'), /Invalid bossId/);
+
+    frame = session.reset(5555, 'mode_single_15', 0, true, 'boss_17');
+    const order = [15, 16, 18, 13, 12, 0, 2, 8]; // compact action type codes: infoReady, band, diyBring, choice, cmdChoice, ready, sell, destroy
+    let steps = 0;
+    while (!frame.terminal) {
+      assert.ok(steps < 3000, 'Match exceeded step guard');
+      let choice = 0;
+      for (const code of order) {
+        const idx = frame.cactions.findIndex((a) => a[0] === code);
+        if (idx >= 0) { choice = idx; break; }
+      }
+      frame = session.step({ decision_id: frame.decision_id, action_key: choice, policy_version: 0 });
+      steps++;
+    }
+    assert.equal(frame.bossId, 'boss_17');
+    assert.equal(typeof frame.bossDmgRatio, 'number');
+    assert.ok(frame.bossDmgRatio >= 0 && frame.bossDmgRatio <= 1);
+  } finally {
+    session.dispose();
+  }
+});

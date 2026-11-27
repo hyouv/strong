@@ -14,8 +14,9 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import random
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -69,6 +70,7 @@ class PPOConfig:
     victory_reward: float = 1.0
     defeat_reward: float = -1.0
     hidden_clear_bonus: float = 0.0   # extra reward when clearing Hidden Core (round 15)
+    boss_dmg_defeat_bonus: float = 0.0  # shaped terminal credit on defeat: +bonus * boss_dmg_ratio (R14 boss HP dealt)
 
 
 @dataclass
@@ -132,6 +134,66 @@ def build_curriculum_episode_modes(
         else:
             out.append(mix_modes[(mix_offset + mi) % len(mix_modes)])
             mi += 1
+    return out
+
+
+def parse_boss_weights(spec: str) -> dict[str, float]:
+    """Parse prioritized boss multipliers like 'boss_17:3,boss_4:2,boss_12:2'."""
+    raw = spec.strip()
+    if not raw:
+        return {}
+    out: dict[str, float] = {}
+    for item in raw.split(","):
+        tok = item.strip()
+        if not tok:
+            continue
+        if ":" not in tok:
+            raise ValueError(f"Invalid --boss-weights entry {tok!r} (expected bossId:multiplier)")
+        bid, w_str = tok.split(":", 1)
+        bid = bid.strip()
+        w = float(w_str.strip())
+        if not bid or not math.isfinite(w) or w <= 0.0:
+            raise ValueError(f"Invalid --boss-weights entry {tok!r} (multiplier must be > 0)")
+        out[bid] = w
+    return out
+
+
+def build_curriculum_episode_bosses(
+    episode_modes: Sequence[str],
+    target_modes: Sequence[str],
+    boss_weight_multipliers: Mapping[str, float],
+    catalog: GameCatalog,
+    *,
+    rng_seed: int = 0,
+) -> list[str | None]:
+    """Sample per-episode bossId overrides for target-mode episodes using weighted boss multipliers.
+
+    Non-target (replay mix) episodes receive None so they keep natural RNG boss draws.
+    """
+    if not boss_weight_multipliers:
+        return [None] * len(episode_modes)
+    target_set = set(target_modes)
+    valid_target_bosses: set[str] = set()
+    for m in target_set:
+        for bid, _ in catalog.mode_boss_weights.get(m, ()):
+            valid_target_bosses.add(bid)
+    unknown = sorted(set(boss_weight_multipliers.keys()) - valid_target_bosses)
+    if unknown:
+        raise ValueError(f"Unknown bossId(s) in --boss-weights for modes {sorted(target_set)}: {unknown}")
+
+    rng = random.Random(rng_seed)
+    out: list[str | None] = []
+    for m in episode_modes:
+        if m not in target_set:
+            out.append(None)
+            continue
+        pairs = catalog.mode_boss_weights.get(m, ())
+        if not pairs:
+            out.append(None)
+            continue
+        bids = [bid for bid, _ in pairs]
+        weights = [base_w * float(boss_weight_multipliers.get(bid, 1.0)) for bid, base_w in pairs]
+        out.append(rng.choices(bids, weights=weights, k=1)[0])
     return out
 
 
@@ -259,6 +321,7 @@ def collect_ppo_rollouts(
     num_episodes: int = 8,
     modes: Sequence[str] = SOLO_TIER1_MODES,
     episode_modes: Sequence[str] | None = None,
+    episode_bosses: Sequence[str | None] | None = None,
     seed_start: int = 20000,
     num_workers: int = 8,
     ppo_cfg: PPOConfig | None = None,
@@ -287,6 +350,7 @@ def collect_ppo_rollouts(
                 num_episodes=num_episodes,
                 modes=modes,
                 episode_modes=episode_modes,
+                episode_bosses=episode_bosses,
                 seed_start=seed_start,
                 step_penalty=cfg.step_penalty,
                 round_survive_bonus=cfg.round_survive_bonus,
@@ -294,6 +358,7 @@ def collect_ppo_rollouts(
                 victory_reward=cfg.victory_reward,
                 defeat_reward=cfg.defeat_reward,
                 hidden_clear_bonus=cfg.hidden_clear_bonus,
+                boss_dmg_defeat_bonus=cfg.boss_dmg_defeat_bonus,
                 prep_timeout_penalty=cfg.prep_timeout_penalty,
                 repeat_state_penalty=cfg.repeat_state_penalty,
                 max_prep_steps_per_round=cfg.max_prep_steps_per_round,
@@ -337,12 +402,18 @@ def collect_ppo_rollouts(
         ep_timeout_penalized: dict[int, bool] = {}
 
         def _spawn_cmd(ep_idx: int) -> dict[str, Any]:
-            return {
+            cmd: dict[str, Any] = {
                 "op": "reset",
                 "seed": seed_start + ep_idx,
                 "modeId": mode_sched[ep_idx % len(mode_sched)],
                 "policy_version": 0,
+                "compact": cfg.boss_dmg_defeat_bonus != 0.0,
             }
+            if episode_bosses:
+                bid = episode_bosses[ep_idx % len(episode_bosses)]
+                if bid:
+                    cmd["bossId"] = bid
+            return cmd
 
         init_cmds = {}
         for w in range(n_workers):
@@ -461,6 +532,9 @@ def collect_ppo_rollouts(
                     rounds_passed.append(rnds)
                     if ep_buf[w]:
                         ep_buf[w][-1].reward += cfg.victory_reward if win else cfg.defeat_reward
+                        boss_dmg_ratio = float(rep.get("bossDmgRatio") or 0.0)
+                        if (not win) and cfg.boss_dmg_defeat_bonus != 0.0 and boss_dmg_ratio > 0.0:
+                            ep_buf[w][-1].reward += cfg.boss_dmg_defeat_bonus * boss_dmg_ratio
                         if hid_cleared and cfg.hidden_clear_bonus != 0.0:
                             ep_buf[w][-1].reward += cfg.hidden_clear_bonus
                         ep_buf[w][-1].done = True
@@ -712,6 +786,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--victory-reward", type=float, default=1.0)
     parser.add_argument("--defeat-reward", type=float, default=-1.0)
     parser.add_argument("--hidden-clear-bonus", type=float, default=0.0, help="Extra terminal reward for clearing round-15 Hidden Core")
+    parser.add_argument("--boss-dmg-defeat-bonus", type=float, default=0.0, help="Shaped defeat credit: +bonus * R14 boss HP damage ratio")
+    parser.add_argument("--boss-weights", type=str, default="", help="Prioritized target-mode boss multipliers, e.g. 'boss_17:3,boss_4:2,boss_12:2'")
     parser.add_argument("--seed", type=int, default=20000)
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, or cuda:<idx>")
     parser.add_argument("--eval-episodes", type=int, default=32)
@@ -727,10 +803,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     modes = parse_solo_modes(args.modes)
     eval_modes = parse_solo_modes(args.eval_modes) if args.eval_modes else modes
     mix_modes = parse_solo_modes(args.mix_modes) if args.mix_modes else ()
+    boss_weights = parse_boss_weights(args.boss_weights)
     device = resolve_device(args.device)
     print(
         f"Using device: {describe_device(device)} | modes={modes}"
-        + (f" | mix={mix_modes} ({args.mix_ratio_start:.2f}->{args.mix_ratio_end:.2f})" if mix_modes else ""),
+        + (f" | mix={mix_modes} ({args.mix_ratio_start:.2f}->{args.mix_ratio_end:.2f})" if mix_modes else "")
+        + (f" | boss_weights={boss_weights}" if boss_weights else ""),
         flush=True,
     )
 
@@ -791,6 +869,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         victory_reward=args.victory_reward,
         defeat_reward=args.defeat_reward,
         hidden_clear_bonus=args.hidden_clear_bonus,
+        boss_dmg_defeat_bonus=args.boss_dmg_defeat_bonus,
     )
     critic_opt = torch.optim.AdamW(model.value_head.parameters(), lr=ppo_cfg.critic_lr, weight_decay=1e-4)
     full_opt = torch.optim.AdamW(model.parameters(), lr=ppo_cfg.lr, weight_decay=1e-4)
@@ -888,12 +967,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             mix_cursor += n_mix_cur
             tgt_cursor += args.episodes_per_update - n_mix_cur
 
+            ep_bosses = build_curriculum_episode_bosses(
+                ep_modes,
+                modes,
+                boss_weights,
+                cat,
+                rng_seed=args.seed + upd * 1009,
+            )
+
             rollout, r_stats = collect_ppo_rollouts(
                 model,
                 ref_model=ref_model,
                 num_episodes=args.episodes_per_update,
                 modes=modes,
                 episode_modes=ep_modes,
+                episode_bosses=ep_bosses,
                 seed_start=args.seed + (upd - 1) * args.episodes_per_update,
                 num_workers=args.workers,
                 ppo_cfg=ppo_cfg,

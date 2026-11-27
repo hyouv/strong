@@ -221,6 +221,7 @@ class GameCatalog:
     chess_meta: dict[str, ChessMeta]
     item_meta: dict[str, ItemMeta]
     token_pos_class: dict[str, int]
+    mode_boss_weights: dict[str, tuple[tuple[str, float], ...]]
 
     @property
     def num_bonds(self) -> int:
@@ -285,6 +286,7 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
     choices_raw: Any = json.loads((root / "choices.json").read_text(encoding="utf-8"))
     effects_raw: dict[str, Any] = json.loads((root / "effects.json").read_text(encoding="utf-8"))
     factions_raw: dict[str, Any] = json.loads((root / "factions.json").read_text(encoding="utf-8"))
+    config_raw: dict[str, Any] = json.loads((root / "config.json").read_text(encoding="utf-8"))
 
     bond_ids = tuple(bonds_raw.keys())
     bond_to_idx = {k: i for i, k in enumerate(bond_ids)}
@@ -377,6 +379,13 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
         sid: _build_stage_spatial_grid(st, boss_left=True) for sid, st in stages_raw.items()
     }
 
+    mode_boss_weights: dict[str, tuple[tuple[str, float], ...]] = {}
+    for mid, mcfg in (config_raw.get("modes") or {}).items():
+        bw = mcfg.get("bossWeights") or {}
+        pairs = tuple((str(bid), float(w)) for bid, w in bw.items() if float(w) > 0.0)
+        if pairs:
+            mode_boss_weights[str(mid)] = pairs
+
     return GameCatalog(
         entity_to_idx=entity_to_idx,
         num_entities=len(entity_to_idx) + 1,
@@ -395,4 +404,5 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
         chess_meta=chess_meta,
         item_meta=item_meta,
         token_pos_class=token_pos_class,
+        mode_boss_weights=mode_boss_weights,
     )

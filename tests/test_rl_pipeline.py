@@ -44,8 +44,10 @@ from stronghold_rl.model import PolicyConfig, StrongholdPolicyNet
 from stronghold_rl.ppo import (
     PPOConfig,
     _finalize_ppo_batch,
+    build_curriculum_episode_bosses,
     build_curriculum_episode_modes,
     collect_ppo_rollouts,
+    parse_boss_weights,
     ppo_update,
 )
 from stronghold_rl.rollout import AsyncActorPool, mask_cycle_action_types, prep_state_signature
@@ -630,3 +632,56 @@ def test_round_boundary_gae_lambda_preserves_intra_round_credit() -> None:
     cfg_legacy = PPOConfig(gamma_intra=1.0, gamma_round=0.97, gae_lambda=0.95, gae_lambda_intra=None, kl_coef=0.0)
     b_legacy, _ = _finalize_ppo_batch([ep], cfg=cfg_legacy, ref_model=None, device="cpu")
     assert float(b_fixed["returns"][0]) > float(b_legacy["returns"][0]) + 0.8
+
+
+def test_boss_curriculum_and_boss_damage_shaping() -> None:
+    """Verify boss weight parsing, target-only boss oversampling, boss_dmg_defeat_bonus, and eval by_boss."""
+    cat = get_catalog()
+    bw = parse_boss_weights("boss_17:3,boss_4:2,boss_12:2")
+    assert bw == {"boss_17": 3.0, "boss_4": 2.0, "boss_12": 2.0}
+
+    abyss = parse_solo_modes("15-20")
+    earlier = parse_solo_modes("1-14")
+    ep_modes = build_curriculum_episode_modes(120, abyss, mix_modes=earlier, mix_ratio=0.2)
+    ep_bosses = build_curriculum_episode_bosses(ep_modes, abyss, bw, cat, rng_seed=42)
+    assert len(ep_bosses) == 120
+    # Replay episodes must keep None; target episodes must get valid boss IDs with boss_17 oversampled
+    for m, b in zip(ep_modes, ep_bosses):
+        if m in earlier:
+            assert b is None
+        else:
+            assert b is not None
+    cnt_17 = sum(1 for b in ep_bosses if b == "boss_17")
+    assert cnt_17 >= 10  # expected ~20.6 out of 96 target episodes
+
+    # End-to-end rollout with forced boss_17 + boss_dmg_defeat_bonus + eval by_boss reporting
+    model = StrongholdPolicyNet(catalog=cat, config=PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128))
+    cfg = PPOConfig(max_prep_steps_per_round=15, boss_dmg_defeat_bonus=0.5, kl_coef=0.0)
+    with AsyncActorPool(num_workers=2, min_batch=2, batch_timeout_ms=2.0) as pool:
+        batch, r_stats = collect_ppo_rollouts(
+            model,
+            num_episodes=2,
+            modes=("mode_single_15",),
+            episode_bosses=("boss_17", "boss_4"),
+            seed_start=26000,
+            num_workers=2,
+            ppo_cfg=cfg,
+            catalog=cat,
+            pool=pool,
+        )
+        assert r_stats["episodes"] == 2
+        assert torch.isfinite(batch["returns"]).all()
+
+        ev = evaluate_policy_solo(
+            model,
+            modes=("mode_single_15",),
+            seeds=(9300, 9301),
+            num_workers=2,
+            deterministic=True,
+            break_cycles=True,
+            max_prep_steps_per_round=15,
+            catalog=cat,
+            pool=pool,
+        )
+        assert ev["episodes"] == 2
+        assert sum(v["episodes"] for v in ev["by_boss"].values()) == 2

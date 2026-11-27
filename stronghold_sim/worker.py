@@ -176,12 +176,15 @@ class RoomClient:
         policy_version: int | None = None,
         *,
         compact: bool = False,
+        boss_id: str | None = None,
     ) -> dict[str, Any]:
         req: dict[str, Any] = {"op": "reset", "seed": seed, "modeId": mode_id}
         if policy_version is not None:
             req["policy_version"] = policy_version
         if compact:
             req["compact"] = True
+        if boss_id:
+            req["bossId"] = boss_id
         return self.request(req)
 
     def step(
