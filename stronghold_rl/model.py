@@ -1,4 +1,4 @@
-"""Transformer encoder (114 semantic tokens, isolated embeddings) + 4-step Autoregressive Pointer Head."""
+"""Transformer encoder (121 semantic tokens, isolated embeddings) + 4-step Autoregressive Pointer Head."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -17,10 +17,10 @@ from .codec import (
     CAT_DIR,
     CAT_ENTITY,
     CAT_EQUIP0,
-    CAT_EQUIP1,
     CAT_SEG,
     CAT_STAGE,
     CONT_DIM,
+    MAX_EQUIP_SLOTS,
     NO_ARG,
     NUM_ACTION_TYPES,
     NUM_SEGMENTS,
@@ -218,8 +218,8 @@ class StrongholdPolicyNet(nn.Module):
         self.seg_emb = nn.Embedding(NUM_SEGMENTS, d)
         self.slot_emb = nn.Embedding(NUM_TOKENS, d)
         self.entity_emb = nn.Embedding(self.num_entities, d, padding_idx=0)
-        self.equip_emb = nn.Embedding(self.num_items, d // 2, padding_idx=0)
-        self.equip_proj = nn.Linear(d, d, bias=False)
+        self.equip_emb = nn.Embedding(self.num_items, d, padding_idx=0)
+        self.equip_slot_emb = nn.Embedding(MAX_EQUIP_SLOTS, d)
 
         self.band_emb = nn.Embedding(self.num_bands + 1, d, padding_idx=0)
         self.bond_emb = nn.Embedding(self.num_bonds + 1, d, padding_idx=0)
@@ -281,7 +281,7 @@ class StrongholdPolicyNet(nn.Module):
         self.tgt_ctx_proj = nn.Sequential(nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, d))
         self.tgt_key_proj = nn.Linear(d, d, bias=False)
 
-        # ---- Step 4: Sub-option (Board Facing 0..3 / Equip Replace 0..3) ---
+        # ---- Step 4: Sub-option (Board Facing 0..3 / Equip Replace 0..5) ---
         self.opt_ctx_proj = nn.Sequential(nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, d))
         self.dir_head = nn.Linear(d, NUM_SUB_OPTS)
         self.replace_head = nn.Linear(d, NUM_SUB_OPTS)
@@ -290,7 +290,7 @@ class StrongholdPolicyNet(nn.Module):
 
     def encode_tokens(
         self,
-        cat_ids: torch.Tensor,    # [B, N, 8]
+        cat_ids: torch.Tensor,    # [B, N, NUM_CAT_FIELDS]
         cont_feats: torch.Tensor, # [B, N, CONT_DIM]
         valid_mask: torch.Tensor, # [B, N] bool
     ) -> torch.Tensor:
@@ -302,12 +302,9 @@ class StrongholdPolicyNet(nn.Module):
         seg = self.seg_emb(cat_ids[:, :, CAT_SEG])
         pos = self.slot_emb(slots)
         ent = self.entity_emb(cat_ids[:, :, CAT_ENTITY])
-        eq = self.equip_proj(
-            torch.cat(
-                [self.equip_emb(cat_ids[:, :, CAT_EQUIP0]), self.equip_emb(cat_ids[:, :, CAT_EQUIP1])],
-                dim=-1,
-            )
-        )
+        eq_ids = cat_ids[:, :, CAT_EQUIP0 : CAT_EQUIP0 + MAX_EQUIP_SLOTS]
+        eq_valid = (eq_ids > 0).unsqueeze(-1)
+        eq = ((self.equip_emb(eq_ids) + self.equip_slot_emb.weight.view(1, 1, MAX_EQUIP_SLOTS, -1)) * eq_valid).sum(dim=2)
         band = self.band_emb(cat_ids[:, :, CAT_BAND])
         bond = self.bond_emb(cat_ids[:, :, CAT_BOND])
         stage = self.stage_emb(cat_ids[:, :, CAT_STAGE])

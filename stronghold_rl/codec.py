@@ -1,31 +1,31 @@
-"""Observation tokenizer (114 semantic tokens) and lossless hierarchical action codec.
+"""Observation tokenizer (121 semantic tokens) and lossless hierarchical action codec.
 
-Token layout (fixed N = 114 tokens):
+Token layout (fixed N = 121 tokens):
   [0]        POLICY_CLS   (1)  Learnable Actor readout token (feeds type_head & Step 2/3/4 ctx)
   [1]        VALUE_CLS    (1)  Learnable Critic readout token (feeds value_head independently)
-  [2]        MATCH_STAGE  (1)  Phase, round, difficulty, LP, stageId, 9-dim enemy factions
-  [3]        BOSS         (1)  Boss & hiddenBoss entity IDs, boss-round flags
-  [4]        ECONOMY_SHOP (1)  Funds, shop level, upgrade/refresh prices, frozen, deploy cap, stash
-  [5]        BAND_COMMAND (1)  Opening bandId + active/passive command effectId, cost, CD, uses
-  [6..11]    EFFECTS      (6)  Active in-match effects / SP buffs (`own.effects`)
+  [2]        MATCH_STAGE  (1)  Phase, round, difficulty, LP, stageId, 9-dim enemy factions, scaling
+  [3]        BOSS         (1)  Boss & hiddenBoss entity IDs, pool HP, combat stats, spawn tile
+  [4]        ECONOMY_SHOP (1)  Funds, shop level, upgrade/refresh prices, frozen, deploy cap, frontline
+  [5]        BAND_COMMAND (1)  Opening bandId + active/passive command effectId, cost, CD, uses, macro bonds
+  [6..11]    EFFECTS      (6)  Active in-match effects / SP buffs / bounties (`own.effects`)
   [12..47]   BOARD_TILES  (36) 4x9 battlefield grid (row 9..12, col 2..10) + path/terrain + unit
   [48..57]   HAND_SLOTS   (10) Bench / hand slots 0..9
   [58..62]   TEMP_SLOTS   (5)  Equipment / temp storage slots 0..4
   [63..68]   SHOP_SLOTS   (6)  Shop offer slots 0..5
-  [69..71]   REWARD_SLOTS (3)  Free reward offer slots 0..2
-  [72..79]   CHOICE_CARDS (8)  Bond group / SP draft / personal choice / command draft cards
-  [80..105]  BONDS        (26) Bond synergy state tokens
-  [106..113] ENEMIES      (8)  Next-wave enemy preview summary tokens
+  [69..74]   REWARD_SLOTS (6)  Free reward offer slots 0..5 (`MAX_OFFER_SLOTS = 6`)
+  [75..82]   CHOICE_CARDS (8)  Bond group / SP draft / personal choice cards
+  [83..86]   CMD_CHOICES  (4)  Dedicated command replacement draft cards (`own.commandDraft`)
+  [87..112]  BONDS        (26) Bond synergy state tokens
+  [113..120] ENEMIES      (8)  Next-wave enemy preview summary tokens
 
-Isolated categorical ID fields per token (`NUM_CAT_FIELDS = 8`, 0 = PAD/NONE for all non-segment fields):
-  col 0: segment_id  in [0, 15)
-  col 1: entity_id   in [0, num_entities)  (chess / item / token / enemy / boss / effect / choice)
-  col 2: equip0_id   in [0, num_items)     (equipped item slot 0 on chess; 0 elsewhere)
-  col 3: equip1_id   in [0, num_items)     (equipped item slot 1 on chess; 0 elsewhere)
-  col 4: band_id     in [0, num_bands+1)   (BAND_COMMAND token only)
-  col 5: bond_id     in [0, num_bonds+1)   (BONDS tokens only)
-  col 6: stage_id    in [0, num_stages)    (MATCH_STAGE token only)
-  col 7: dir_id      in [0, 5)             (occupied BOARD_TILES only: 1=R, 2=U, 3=L, 4=D)
+Isolated categorical ID fields per token (`NUM_CAT_FIELDS = 12`, 0 = PAD/NONE for all non-segment fields):
+  col 0:     segment_id  in [0, 16)
+  col 1:     entity_id   in [0, num_entities)  (chess / item / token / enemy / boss / effect / choice)
+  col 2..7:  equip0..5   in [0, num_items)     (equipped item slots 0..5 on chess; 0 elsewhere)
+  col 8:     band_id     in [0, num_bands+1)   (BAND_COMMAND token only)
+  col 9:     bond_id     in [0, num_bonds+1)   (BONDS tokens only)
+  col 10:    stage_id    in [0, num_stages)    (MATCH_STAGE token only)
+  col 11:    dir_id      in [0, 5)             (occupied BOARD_TILES only: 1=R, 2=U, 3=L, 4=D)
 """
 from __future__ import annotations
 
@@ -61,16 +61,20 @@ BOARD_OFFSET = 12              # 12..47  (36)
 HAND_OFFSET = 48               # 48..57  (10)
 TEMP_OFFSET = 58               # 58..62  (5)
 SHOP_OFFSET = 63               # 63..68  (6)
-REWARD_OFFSET = 69             # 69..71  (3)
-CHOICE_OFFSET = 72             # 72..79  (8)
-BOND_OFFSET = 80               # 80..105 (26)
-ENEMY_OFFSET = 106             # 106..113 (8)
-NUM_TOKENS = 114
+REWARD_OFFSET = 69             # 69..74  (6)
+CHOICE_OFFSET = 75             # 75..82  (8)
+CMD_CHOICE_OFFSET = 83         # 83..86  (4)
+BOND_OFFSET = 87               # 87..112 (26)
+ENEMY_OFFSET = 113             # 113..120 (8)
+NUM_TOKENS = 121
 
 MAX_EFFECT_SLOTS = 6
+MAX_REWARD_SLOTS = 6
 MAX_CHOICE_SLOTS = 8
+MAX_CMD_CHOICE_SLOTS = 4
 MAX_ENEMY_SLOTS = 8
-NUM_SUB_OPTS = 4  # 4 directions for MOVE(board), up to 4 item replace slots for EQUIP
+MAX_EQUIP_SLOTS = 6
+NUM_SUB_OPTS = 6  # 0..3 directions for MOVE(board), up to 0..5 item replace slots for EQUIP
 
 # Token segment types (for segment embedding)
 SEG_POLICY_CLS = 0
@@ -88,19 +92,24 @@ SEG_REWARD = 11
 SEG_CHOICE = 12
 SEG_BOND = 13
 SEG_ENEMY = 14
-NUM_SEGMENTS = 15
+SEG_CMD_CHOICE = 15
+NUM_SEGMENTS = 16
 
 # Per-token isolated categorical fields:
-#   [segment_id, entity_id, equip0_id, equip1_id, band_id, bond_id, stage_id, dir_id]
+#   [segment_id, entity_id, equip0..5, band_id, bond_id, stage_id, dir_id]
 CAT_SEG = 0
 CAT_ENTITY = 1
 CAT_EQUIP0 = 2
 CAT_EQUIP1 = 3
-CAT_BAND = 4
-CAT_BOND = 5
-CAT_STAGE = 6
-CAT_DIR = 7
-NUM_CAT_FIELDS = 8
+CAT_EQUIP2 = 4
+CAT_EQUIP3 = 5
+CAT_EQUIP4 = 6
+CAT_EQUIP5 = 7
+CAT_BAND = 8
+CAT_BOND = 9
+CAT_STAGE = 10
+CAT_DIR = 11
+NUM_CAT_FIELDS = 12
 
 # Per-token continuous features
 CONT_DIM = 28
@@ -230,10 +239,15 @@ def _get_stage_template(
         cat_base[tok_idx, CAT_SEG] = SEG_SHOP
         cont_base[tok_idx, 18] = float(i) / 5.0
 
-    for i in range(3):
+    for i in range(MAX_REWARD_SLOTS):
         tok_idx = REWARD_OFFSET + i
         cat_base[tok_idx, CAT_SEG] = SEG_REWARD
-        cont_base[tok_idx, 18] = float(i) / 2.0
+        cont_base[tok_idx, 18] = float(i) / float(max(1, MAX_REWARD_SLOTS - 1))
+
+    for i in range(MAX_CMD_CHOICE_SLOTS):
+        tok_idx = CMD_CHOICE_OFFSET + i
+        cat_base[tok_idx, CAT_SEG] = SEG_CMD_CHOICE
+        cont_base[tok_idx, 18] = float(i) / float(max(1, MAX_CMD_CHOICE_SLOTS - 1))
 
     for i in range(len(cat.bond_ids)):
         tok_idx = BOND_OFFSET + i
@@ -494,8 +508,11 @@ def _index_actions_dict(
             a_type = TYPE_BUY
             src = SHOP_OFFSET + int(act["slot"])
         elif t == "g.reward":
+            idx = int(act["idx"])
+            if not (0 <= idx < MAX_REWARD_SLOTS):
+                raise ValueError(f"Reward idx out of range: {idx}")
             a_type = TYPE_REWARD
-            src = REWARD_OFFSET + int(act["idx"])
+            src = REWARD_OFFSET + idx
         elif t == "g.sell":
             a_type = TYPE_SELL
             src = uid_to_token[int(act["uid"])]
@@ -513,10 +530,10 @@ def _index_actions_dict(
             src = CHOICE_OFFSET + idx
         elif t == "g.commandChoice":
             idx = int(act["idx"])
-            if not (0 <= idx < MAX_CHOICE_SLOTS):
+            if not (0 <= idx < MAX_CMD_CHOICE_SLOTS):
                 raise ValueError(f"Command choice idx out of range: {idx}")
             a_type = TYPE_COMMAND_CHOICE
-            src = CHOICE_OFFSET + idx
+            src = CMD_CHOICE_OFFSET + idx
         elif t == "g.band":
             a_type = TYPE_BAND
             src = band_to_idx[act["bandId"]]
@@ -713,6 +730,8 @@ def _index_actions_compact(
                     key_to_tuple.append((7, src, tgt, NO_ARG))
             else:
                 rep_slot = uid_to_items.get(tgt_uid, []).index(rep_uid)
+                if not (0 <= rep_slot < NUM_SUB_OPTS):
+                    raise ValueError(f"replace slot out of range: {rep_slot}")
                 k3 = (7, src, tgt)
                 opt_bits[k3] = opt_bits.get(k3, 0) | (1 << rep_slot)
                 opt_to_key[(7, src, tgt, rep_slot)] = key
@@ -734,8 +753,16 @@ def _index_actions_compact(
         elif code == TYPE_SELL or code == TYPE_DESTROY:
             src = uid_to_token[act[1]]
         elif code == TYPE_REWARD:
-            src = REWARD_OFFSET + act[1]
-        elif code == TYPE_COMMAND_CHOICE or code == TYPE_CHOICE or code == TYPE_BOND_GROUP:
+            idx = act[1]
+            if not (0 <= idx < MAX_REWARD_SLOTS):
+                raise ValueError(f"Reward idx out of range: {idx}")
+            src = REWARD_OFFSET + idx
+        elif code == TYPE_COMMAND_CHOICE:
+            idx = act[1]
+            if not (0 <= idx < MAX_CMD_CHOICE_SLOTS):
+                raise ValueError(f"Command choice idx out of range: {idx}")
+            src = CMD_CHOICE_OFFSET + idx
+        elif code == TYPE_CHOICE or code == TYPE_BOND_GROUP:
             idx = act[1]
             if not (0 <= idx < MAX_CHOICE_SLOTS):
                 raise ValueError(f"Choice idx out of range: {idx}")
@@ -820,9 +847,11 @@ def _fill_features_numpy(
     rnd = int(pub.get("round") or 0)
     last_rnd = max(1, int(pub.get("lastRound") or 14))
     boss_round = int(pub.get("bossRound") or 99)
-    hidden_round = int(pub.get("hiddenRound") or 99)
+    raw_hidden_round = pub.get("hiddenRound")
+    has_hidden_round = raw_hidden_round is not None
+    hidden_round = int(raw_hidden_round) if has_hidden_round else 99
     is_boss = rnd >= boss_round
-    is_hidden = rnd >= hidden_round
+    is_hidden = has_hidden_round and rnd >= hidden_round
     stage_id = pub.get("stageId")
     mode_id = pub.get("modeId")
     difficulty = pub.get("difficulty") or "FUNNY"
@@ -855,7 +884,6 @@ def _fill_features_numpy(
 
     owned_base_counts: dict[int, int] = {}
     owned_item_counts: dict[int, int] = {}
-    owned_item_merge_counts: dict[int, int] = {}
     board_base_indices: set[int] = set()
     board_uids: set[int] = set()
     uid_to_token: dict[int, int] = {}
@@ -880,13 +908,12 @@ def _fill_features_numpy(
                     im = item_meta.get(eq_it.get("id"))
                     if im and not im.is_golden:
                         ei = im.entity_idx
-                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+                        owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
             elif kind == "item" and not p.get("golden"):
                 im = item_meta.get(p.get("id"))
                 if im:
                     ei = im.entity_idx
                     owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
-                    owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
     free_hand = 0
     unequipped_item_cnt = 0
     for p in hand_list:
@@ -901,7 +928,6 @@ def _fill_features_numpy(
                     if im:
                         ei = im.entity_idx
                         owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
-                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
             elif kind == "chess":
                 if not p.get("golden"):
                     cm = chess_meta.get(p.get("id"))
@@ -912,7 +938,7 @@ def _fill_features_numpy(
                     im = item_meta.get(eq_it.get("id"))
                     if im and not im.is_golden:
                         ei = im.entity_idx
-                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+                        owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
     free_temp = 0
     for p in temp_list:
         if p is None:
@@ -926,7 +952,6 @@ def _fill_features_numpy(
                     if im:
                         ei = im.entity_idx
                         owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
-                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
             elif kind == "chess":
                 if not p.get("golden"):
                     cm = chess_meta.get(p.get("id"))
@@ -937,7 +962,7 @@ def _fill_features_numpy(
                     im = item_meta.get(eq_it.get("id"))
                     if im and not im.is_golden:
                         ei = im.entity_idx
-                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+                        owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
 
     # ---- Pre-pass [80..105] BONDS dynamic state & macro synergy summary ----
     bond_to_idx = cat.bond_to_idx
@@ -990,7 +1015,7 @@ def _fill_features_numpy(
                     break
             if next_delta == 1:
                 f[9] = 1.0
-            elif next_delta == 0 and cnt >= ths[-1]:
+            elif is_act and next_delta == 0 and cnt >= ths[-1]:
                 f[11] = 1.0
         bond_next_delta[bi] = next_delta
 
@@ -1025,7 +1050,7 @@ def _fill_features_numpy(
         if fi is not None and 14 + fi < 23:
             ms[14 + fi] = 1.0
     ms[23] = (700.0 if total_activated_layers > 700 else float(total_activated_layers)) / 350.0
-    if total_activated_layers > 350 and lp_val > 1:
+    if has_hidden_round and total_activated_layers > 350 and lp_val > 1:
         ms[24] = 1.0
     ms[25] = atk_scale / 3.0
     ms[26] = hp_scale / 4.0
@@ -1055,12 +1080,14 @@ def _fill_features_numpy(
         bf[10] = float(bm.lpr) / 30.0
         bem = enemy_meta.get(bm.enemy_key)
         if bem is not None:
+            b_target_rnd = hidden_round if is_hidden else (boss_round if boss_round < 90 else last_rnd)
+            b_atk_sc, _, b_spd_sc = cat.enemy_scale(mode_id, max(1, b_target_rnd))
             if bem.atk > 0.0:
-                bf[6] = log1p(bem.atk) / 10.0
+                bf[6] = log1p(bem.atk * b_atk_sc) / 10.0
             if bem.def_ > 0.0:
                 bf[7] = log1p(bem.def_) / 8.0
             bf[8] = bem.res / 100.0
-            bf[9] = bem.move_speed / 2.0
+            bf[9] = (bem.move_speed * b_spd_sc) / 2.0
             if bem.is_arts:
                 bf[11] = 1.0
             if bem.is_ranged:
@@ -1186,7 +1213,10 @@ def _fill_features_numpy(
         for i, eff in enumerate(valid_effects[:MAX_EFFECT_SLOTS]):
             tok_idx = EFFECT_OFFSET + i
             valid_np[tok_idx] = True
-            cat_np[tok_idx, CAT_ENTITY] = entity_idx_fn(eff.get("id"))
+            e_ent = entity_idx_fn(eff.get("id"))
+            if e_ent == 0:
+                e_ent = entity_idx_fn(eff.get("iconId"))
+            cat_np[tok_idx, CAT_ENTITY] = e_ent
             ef = cont_np[tok_idx]
             ef[0] = 1.0
             if eff.get("command"):
@@ -1219,9 +1249,8 @@ def _fill_features_numpy(
         items = p.get("items") or ()
         if items:
             uid_to_items[uid] = [int(it["uid"]) for it in items]
-            cat_np[tok_idx, CAT_EQUIP0] = item_idx_fn(items[0].get("id"))
-            if len(items) > 1:
-                cat_np[tok_idx, CAT_EQUIP1] = item_idx_fn(items[1].get("id"))
+            for eq_j, eq_it in enumerate(items[:MAX_EQUIP_SLOTS]):
+                cat_np[tok_idx, CAT_EQUIP0 + eq_j] = item_idx_fn(eq_it.get("id"))
         else:
             uid_to_items[uid] = []
 
@@ -1416,7 +1445,7 @@ def _fill_features_numpy(
                 f[9] = float(owned_it) * 0.5
                 if im.mergeable and not im.is_golden:
                     need = im.upgrade_num if im.upgrade_num > 1 else 2
-                    if need < 100 and owned_item_merge_counts.get(im.entity_idx, 0) + 1 >= need:
+                    if need < 100 and owned_it + 1 >= need:
                         f[10] = 1.0
                 gb = im.give_bond_idx
                 if gb >= 0:
@@ -1455,7 +1484,7 @@ def _fill_features_numpy(
     if reward_offer:
         reward_slots = reward_offer.get("slots")
         if reward_slots:
-            for i, s in enumerate(reward_slots[:3]):
+            for i, s in enumerate(reward_slots[:MAX_REWARD_SLOTS]):
                 if s is None:
                     continue
                 tok_idx = REWARD_OFFSET + i
@@ -1469,7 +1498,7 @@ def _fill_features_numpy(
                     f[3] = 1.0
                 _fill_offer_synergy(f, kind, sid)
 
-    # ---- [72..79] CHOICE_CARDS (8) -----------------------------------------
+    # ---- [75..82] CHOICE_CARDS (8) -----------------------------------------
     bond_group_members0: Sequence[str] = ()
     bond_group_members1: Sequence[str] = ()
     if phase == "INFO_CHECK" and bond_choice and bond_choice.get("picked") is None:
@@ -1483,7 +1512,7 @@ def _fill_features_numpy(
             f[0] = 1.0
             f[1] = 1.0
             f[5] = float(len(grp)) / 6.0
-            f[18] = float(i)
+            f[18] = float(i) / 7.0
             for bid in grp:
                 bi = bond_to_idx.get(bid)
                 if bi is not None:
@@ -1523,18 +1552,21 @@ def _fill_features_numpy(
             f[2] = 1.0
             f[5] = float(c.get("tier") or 0) / 6.0
             f[18] = float(i) / 7.0
-    elif cmd_draft:
+
+    # ---- [83..86] CMD_CHOICES (4) — independent from personalChoice --------
+    if cmd_draft:
         cards = cmd_draft.get("cards") or ()
-        for i, c in enumerate(cards[:MAX_CHOICE_SLOTS]):
-            tok_idx = CHOICE_OFFSET + i
+        inv_cmd = 1.0 / float(max(1, MAX_CMD_CHOICE_SLOTS - 1))
+        for i, c in enumerate(cards[:MAX_CMD_CHOICE_SLOTS]):
+            tok_idx = CMD_CHOICE_OFFSET + i
             valid_np[tok_idx] = True
-            cat_np[tok_idx, CAT_SEG] = SEG_CHOICE
+            cat_np[tok_idx, CAT_SEG] = SEG_CMD_CHOICE
             cat_np[tok_idx, CAT_ENTITY] = entity_idx_fn(c.get("effectId"))
             f = cont_np[tok_idx]
             f[0] = 1.0
             f[4] = 1.0
             f[5] = float(c.get("cost") or 0) / 10.0
-            f[18] = float(i) / 7.0
+            f[18] = float(i) * inv_cmd
 
     # Link INFO_CHECK bond groups onto BONDS tokens [80..105] cols 2..3
     for bid in bond_group_members0:
@@ -1612,8 +1644,8 @@ def _fill_features_numpy(
             if em is not None:
                 if is_e_boss:
                     hp_eff = boss_pool_hp if boss_pool_hp > 0.0 else em.max_hp
-                    atk_eff = em.atk
-                    spd_eff = em.move_speed
+                    atk_eff = em.atk * atk_scale
+                    spd_eff = em.move_speed * spd_scale
                 else:
                     hp_eff = em.max_hp * hp_scale
                     atk_eff = em.atk * atk_scale
