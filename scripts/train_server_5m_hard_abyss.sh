@@ -12,11 +12,12 @@
 #   600 updates x 120 eps = 72,000 episodes (~7.2h on 60 workers + RTX 4090)
 #
 # Usage:
-#   ./scripts/train_server_5m_hard_abyss.sh hard              # Stage 1 (HARD L9-14) only
-#   ./scripts/train_server_5m_hard_abyss.sh abyss             # Stage 2 (ABYSS L15-20) only
-#   ./scripts/train_server_5m_hard_abyss.sh all               # Full relay: hard -> abyss (~9.8h)
-#   ./scripts/train_server_5m_hard_abyss.sh eval_hard [CKPT]  # 72-ep per-level eval on L9-14
-#   ./scripts/train_server_5m_hard_abyss.sh eval_abyss [CKPT] # 72-ep per-level eval on L15-20
+#   ./scripts/train_server_5m_hard_abyss.sh hard               # Stage 1 (HARD L9-14) only
+#   ./scripts/train_server_5m_hard_abyss.sh abyss              # Stage 2 (ABYSS L15-20) from HARD best
+#   ./scripts/train_server_5m_hard_abyss.sh resume_abyss       # Fine-tune ABYSS v2 from t4_abyss_last.pt (P0+P1)
+#   ./scripts/train_server_5m_hard_abyss.sh all                # Full relay: hard -> abyss (~9.8h)
+#   ./scripts/train_server_5m_hard_abyss.sh eval_hard [CKPT]   # 72-ep per-level eval on L9-14
+#   ./scripts/train_server_5m_hard_abyss.sh eval_abyss [CKPT]  # 240-ep per-level & per-boss eval on L15-20
 
 set -euo pipefail
 
@@ -107,12 +108,37 @@ ABYSS_MIX_RATIO_START="${ABYSS_MIX_RATIO_START:-0.35}"
 ABYSS_MIX_RATIO_END="${ABYSS_MIX_RATIO_END:-0.12}"
 ABYSS_MIX_ANNEAL_UPDATES="${ABYSS_MIX_ANNEAL_UPDATES:-120}"
 ABYSS_ROUND_SURVIVE_BONUS="${ABYSS_ROUND_SURVIVE_BONUS:-0.05}"
-ABYSS_HIDDEN_CLEAR_BONUS="${ABYSS_HIDDEN_CLEAR_BONUS:-0.8}"
+ABYSS_HIDDEN_CLEAR_BONUS="${ABYSS_HIDDEN_CLEAR_BONUS:-0.25}"
+ABYSS_BOSS_DMG_DEFEAT_BONUS="${ABYSS_BOSS_DMG_DEFEAT_BONUS:-0.5}"
+ABYSS_PREP_TIMEOUT_PENALTY="${ABYSS_PREP_TIMEOUT_PENALTY:--0.10}"
+ABYSS_REPEAT_STATE_PENALTY="${ABYSS_REPEAT_STATE_PENALTY:--0.005}"
+ABYSS_STRATEGIC_ENT_COEF="${ABYSS_STRATEGIC_ENT_COEF:-0.05}"
+ABYSS_STRATEGIC_ENT_COEF_END="${ABYSS_STRATEGIC_ENT_COEF_END:-0.02}"
+ABYSS_BOSS_WEIGHTS="${ABYSS_BOSS_WEIGHTS:-boss_17:3,boss_4:2,boss_12:2}"
+ABYSS_BAN_BANDS="${ABYSS_BAN_BANDS:-band_cannot}"
+ABYSS_BAN_BAND_PROB="${ABYSS_BAN_BAND_PROB:-0.30}"
+ABYSS_BAN_BOND_GROUPS="${ABYSS_BAN_BOND_GROUPS:-lethaniaShip}"
+ABYSS_BAN_BOND_GROUP_PROB="${ABYSS_BAN_BOND_GROUP_PROB:-0.25}"
 ABYSS_SEED="${ABYSS_SEED:-600000}"
-ABYSS_EVAL_EPISODES="${ABYSS_EVAL_EPISODES:-72}" # 12 episodes x 6 ABYSS levels
+ABYSS_EVAL_EPISODES="${ABYSS_EVAL_EPISODES:-240}" # 40 episodes x 6 ABYSS levels (SE ~3.0%, covers all 10 bosses)
 ABYSS_EVAL_SEED_START="${ABYSS_EVAL_SEED_START:-39000}"
 ABYSS_CKPT="${ABYSS_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_last.pt}"
 ABYSS_BEST_CKPT="${ABYSS_BEST_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_best.pt}"
+
+# ---- Stage 2b: Resume ABYSS v2 (from t4_abyss_last.pt, light self-KL annealing to 0) ---------------
+ABYSS_RESUME_INIT_CKPT="${ABYSS_RESUME_INIT_CKPT:-${ABYSS_CKPT}}"
+ABYSS_RESUME_UPDATES="${ABYSS_RESUME_UPDATES:-400}"
+ABYSS_RESUME_CRITIC_WARMUP="${ABYSS_RESUME_CRITIC_WARMUP:-4}"
+ABYSS_RESUME_LR="${ABYSS_RESUME_LR:-2.5e-5}"
+ABYSS_RESUME_LR_END="${ABYSS_RESUME_LR_END:-5e-6}"
+ABYSS_RESUME_KL_COEF="${ABYSS_RESUME_KL_COEF:-0.01}"
+ABYSS_RESUME_KL_COEF_END="${ABYSS_RESUME_KL_COEF_END:-0.0}"
+ABYSS_RESUME_KL_ANNEAL_UPDATES="${ABYSS_RESUME_KL_ANNEAL_UPDATES:-60}"
+ABYSS_RESUME_MIX_RATIO_START="${ABYSS_RESUME_MIX_RATIO_START:-0.12}"
+ABYSS_RESUME_MIX_RATIO_END="${ABYSS_RESUME_MIX_RATIO_END:-0.08}"
+ABYSS_RESUME_SEED="${ABYSS_RESUME_SEED:-800000}"
+ABYSS_V2_CKPT="${ABYSS_V2_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_v2_last.pt}"
+ABYSS_V2_BEST_CKPT="${ABYSS_V2_BEST_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_v2_best.pt}"
 
 EVAL_EVERY="${EVAL_EVERY:-20}"
 SAVE_EVERY="${SAVE_EVERY:-10}"
@@ -203,6 +229,12 @@ run_abyss() {
     --ent-coef "${ABYSS_ENT_COEF}" \
     --ent-coef-end "${ABYSS_ENT_COEF_END}" \
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
+    --strategic-ent-coef "${ABYSS_STRATEGIC_ENT_COEF}" \
+    --strategic-ent-coef-end "${ABYSS_STRATEGIC_ENT_COEF_END}" \
+    --ban-bands "${ABYSS_BAN_BANDS}" \
+    --ban-band-prob "${ABYSS_BAN_BAND_PROB}" \
+    --ban-bond-groups "${ABYSS_BAN_BOND_GROUPS}" \
+    --ban-bond-group-prob "${ABYSS_BAN_BOND_GROUP_PROB}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
     --opt-ent-weight "${PPO_OPT_ENT_WEIGHT}" \
@@ -212,10 +244,14 @@ run_abyss() {
     --target-kl "${PPO_TARGET_KL}" \
     --round-discount \
     --gamma-round 0.97 \
+    --prep-timeout-penalty "${ABYSS_PREP_TIMEOUT_PENALTY}" \
+    --repeat-state-penalty "${ABYSS_REPEAT_STATE_PENALTY}" \
     --round-survive-bonus "${ABYSS_ROUND_SURVIVE_BONUS}" \
     --victory-reward 1.5 \
     --defeat-reward -1.5 \
     --hidden-clear-bonus "${ABYSS_HIDDEN_CLEAR_BONUS}" \
+    --boss-dmg-defeat-bonus "${ABYSS_BOSS_DMG_DEFEAT_BONUS}" \
+    --boss-weights "${ABYSS_BOSS_WEIGHTS}" \
     --seed "${ABYSS_SEED}" \
     --device "${DEVICE}" \
     --eval-episodes "${ABYSS_EVAL_EPISODES}" \
@@ -225,6 +261,70 @@ run_abyss() {
     --eval-temp "${EVAL_TEMP}" \
     --out "${ABYSS_CKPT}" \
     --best-out "${ABYSS_BEST_CKPT}"
+}
+
+run_resume_abyss() {
+  local init_ckpt="${ABYSS_RESUME_INIT_CKPT}"
+  if [[ ! -f "${init_ckpt}" ]]; then
+    echo "ERROR: resume init checkpoint not found: ${init_ckpt}" >&2
+    exit 1
+  fi
+  echo ">>> [Resume] ABYSS v2 P0+P1 fine-tuning (${ABYSS_RESUME_UPDATES} upd x ${PPO_EPISODES_PER_UPDATE} eps)..."
+  echo "    init_ckpt=${init_ckpt} | kl=${ABYSS_RESUME_KL_COEF}->${ABYSS_RESUME_KL_COEF_END} (${ABYSS_RESUME_KL_ANNEAL_UPDATES}u) | boss_weights=${ABYSS_BOSS_WEIGHTS}"
+  "${PYTHON_BIN}" -u -m stronghold_rl.ppo \
+    --modes tier4 \
+    --eval-modes tier4 \
+    --mix-modes "${ABYSS_MIX_MODES}" \
+    --mix-ratio-start "${ABYSS_RESUME_MIX_RATIO_START}" \
+    --mix-ratio-end "${ABYSS_RESUME_MIX_RATIO_END}" \
+    --mix-anneal-updates "${ABYSS_MIX_ANNEAL_UPDATES}" \
+    --init-ckpt "${init_ckpt}" \
+    --updates "${ABYSS_RESUME_UPDATES}" \
+    --episodes-per-update "${PPO_EPISODES_PER_UPDATE}" \
+    --workers "${PPO_WORKERS}" \
+    --min-batch "${PPO_MIN_BATCH}" \
+    --batch-timeout-ms "${PPO_BATCH_TIMEOUT_MS}" \
+    --minibatch-size "${PPO_MINIBATCH_SIZE}" \
+    --critic-warmup "${ABYSS_RESUME_CRITIC_WARMUP}" \
+    --lr "${ABYSS_RESUME_LR}" \
+    --lr-end "${ABYSS_RESUME_LR_END}" \
+    --critic-lr "${PPO_CRITIC_LR}" \
+    --ppo-epochs "${PPO_EPOCHS}" \
+    --ent-coef "${ABYSS_ENT_COEF}" \
+    --ent-coef-end "${ABYSS_ENT_COEF_END}" \
+    --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
+    --strategic-ent-coef "${ABYSS_STRATEGIC_ENT_COEF}" \
+    --strategic-ent-coef-end "${ABYSS_STRATEGIC_ENT_COEF_END}" \
+    --ban-bands "${ABYSS_BAN_BANDS}" \
+    --ban-band-prob "${ABYSS_BAN_BAND_PROB}" \
+    --ban-bond-groups "${ABYSS_BAN_BOND_GROUPS}" \
+    --ban-bond-group-prob "${ABYSS_BAN_BOND_GROUP_PROB}" \
+    --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
+    --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
+    --opt-ent-weight "${PPO_OPT_ENT_WEIGHT}" \
+    --kl-coef "${ABYSS_RESUME_KL_COEF}" \
+    --kl-coef-end "${ABYSS_RESUME_KL_COEF_END}" \
+    --kl-anneal-updates "${ABYSS_RESUME_KL_ANNEAL_UPDATES}" \
+    --target-kl "${PPO_TARGET_KL}" \
+    --round-discount \
+    --gamma-round 0.97 \
+    --prep-timeout-penalty "${ABYSS_PREP_TIMEOUT_PENALTY}" \
+    --repeat-state-penalty "${ABYSS_REPEAT_STATE_PENALTY}" \
+    --round-survive-bonus "${ABYSS_ROUND_SURVIVE_BONUS}" \
+    --victory-reward 1.5 \
+    --defeat-reward -1.5 \
+    --hidden-clear-bonus "${ABYSS_HIDDEN_CLEAR_BONUS}" \
+    --boss-dmg-defeat-bonus "${ABYSS_BOSS_DMG_DEFEAT_BONUS}" \
+    --boss-weights "${ABYSS_BOSS_WEIGHTS}" \
+    --seed "${ABYSS_RESUME_SEED}" \
+    --device "${DEVICE}" \
+    --eval-episodes "${ABYSS_EVAL_EPISODES}" \
+    --eval-every "${EVAL_EVERY}" \
+    --save-every "${SAVE_EVERY}" \
+    --eval-seed-start "${ABYSS_EVAL_SEED_START}" \
+    --eval-temp "${EVAL_TEMP}" \
+    --out "${ABYSS_V2_CKPT}" \
+    --best-out "${ABYSS_V2_BEST_CKPT}"
 }
 
 run_eval() {
@@ -245,16 +345,17 @@ run_eval() {
 
 {
   case "${STAGE}" in
-    hard)       run_hard ;;
-    abyss)      run_abyss ;;
-    eval_hard)  run_eval tier3 "${2:-${HARD_BEST_CKPT}}" "${HARD_EVAL_EPISODES}" "${HARD_EVAL_SEED_START}" ;;
-    eval_abyss) run_eval tier4 "${2:-${ABYSS_BEST_CKPT}}" "${ABYSS_EVAL_EPISODES}" "${ABYSS_EVAL_SEED_START}" ;;
+    hard)         run_hard ;;
+    abyss)        run_abyss ;;
+    resume_abyss) run_resume_abyss ;;
+    eval_hard)    run_eval tier3 "${2:-${HARD_BEST_CKPT}}" "${HARD_EVAL_EPISODES}" "${HARD_EVAL_SEED_START}" ;;
+    eval_abyss)   run_eval tier4 "${2:-${ABYSS_CKPT}}" "${ABYSS_EVAL_EPISODES}" "${ABYSS_EVAL_SEED_START}" ;;
     all)
       run_hard
       run_abyss
       ;;
     *)
-      echo "Usage: $0 [hard|abyss|all|eval_hard [ckpt]|eval_abyss [ckpt]]" >&2
+      echo "Usage: $0 [hard|abyss|resume_abyss|all|eval_hard [ckpt]|eval_abyss [ckpt]]" >&2
       exit 2
       ;;
   esac
