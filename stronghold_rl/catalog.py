@@ -181,6 +181,9 @@ class ChessMeta:
     sell_price: int
     pos_class: int  # 0=all, 1=melee, 2=ranged
     bond_indices: tuple[int, ...]
+    block_cnt: int = 0
+    is_arts: bool = False
+    upgrade_num: int = 3
 
 
 @dataclass(frozen=True)
@@ -190,6 +193,30 @@ class ItemMeta:
     tier: int
     is_golden: bool
     price: int
+    mergeable: bool = False
+    upgrade_num: int = 0
+    give_bond_idx: int = -1
+    can_give_bond: bool = False
+
+
+@dataclass(frozen=True)
+class EnemyMeta:
+    max_hp: float
+    atk: float
+    def_: float
+    res: float
+    move_speed: float
+    lpr: int
+    is_arts: bool
+    is_ranged: bool
+
+
+@dataclass(frozen=True)
+class BossMeta:
+    enemy_key: str
+    blood_by_mode: dict[str, float]
+    blood_by_diff: dict[str, float]
+    lpr: int
 
 
 @dataclass(frozen=True)
@@ -207,6 +234,7 @@ class GameCatalog:
     bond_ids: tuple[str, ...]
     bond_to_idx: dict[str, int]
     core_bond_mask: tuple[bool, ...]
+    core_bond_indices: tuple[int, ...]
 
     band_ids: tuple[str, ...]
     band_to_idx: dict[str, int]
@@ -220,8 +248,11 @@ class GameCatalog:
 
     chess_meta: dict[str, ChessMeta]
     item_meta: dict[str, ItemMeta]
+    enemy_meta: dict[str, EnemyMeta]
+    boss_meta: dict[str, BossMeta]
     token_pos_class: dict[str, int]
     mode_boss_weights: dict[str, tuple[tuple[str, float], ...]]
+    mode_enemy_scale: dict[str, dict[int, tuple[float, float, float]]]  # mode_id -> round -> (atk, hp, speed)
 
     @property
     def num_bonds(self) -> int:
@@ -252,6 +283,31 @@ class GameCatalog:
         if not key:
             return 0
         return self.item_to_idx.get(key, 0)
+
+    def enemy_scale(self, mode_id: str | None, rnd: int) -> tuple[float, float, float]:
+        """Return (atk_mul, hp_mul, speed_mul) for the given mode and round (defaults to 1.0)."""
+        if not mode_id:
+            return (1.0, 1.0, 1.0)
+        tbl = self.mode_enemy_scale.get(mode_id)
+        if not tbl:
+            return (1.0, 1.0, 1.0)
+        sc = tbl.get(int(rnd))
+        if sc is not None:
+            return sc
+        return (1.0, 1.0, 1.0)
+
+    def boss_pool_hp(self, boss_id: str | None, mode_id: str | None, difficulty: str | None) -> float:
+        """Return solo Boss HP pool for the mode (exact bloodByMode, falling back to bloodPoint[difficulty])."""
+        if not boss_id:
+            return 0.0
+        bm = self.boss_meta.get(boss_id)
+        if bm is None:
+            return 0.0
+        if mode_id and mode_id in bm.blood_by_mode:
+            return bm.blood_by_mode[mode_id]
+        if difficulty and difficulty in bm.blood_by_diff:
+            return bm.blood_by_diff[difficulty]
+        return 0.0
 
     def stage_spatial(self, stage_id: str | None, is_boss: bool) -> tuple[TileSpatialInfo, ...]:
         if stage_id:
@@ -291,6 +347,7 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
     bond_ids = tuple(bonds_raw.keys())
     bond_to_idx = {k: i for i, k in enumerate(bond_ids)}
     core_bond_mask = tuple(bool(bonds_raw[k].get("isCore")) for k in bond_ids)
+    core_bond_indices = tuple(i for i, is_core in enumerate(core_bond_mask) if is_core)
 
     band_ids = tuple(bands_raw.keys())
     band_to_idx = {k: i for i, k in enumerate(band_ids)}
@@ -348,6 +405,8 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
     chess_meta: dict[str, ChessMeta] = {}
     for cid, c in chess_raw.items():
         base_id = c.get("baseId") or cid
+        c_stats = c.get("stats") or {}
+        dmg_t = str(c.get("dmgType") or "").lower()
         chess_meta[cid] = ChessMeta(
             entity_idx=_register(cid),
             base_idx=_register(base_id),
@@ -357,16 +416,52 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
             sell_price=int(c.get("sellPrice") or 0),
             pos_class=_pos_to_int(c.get("position")),
             bond_indices=tuple(bond_to_idx[b] for b in (c.get("bonds") or []) if b in bond_to_idx),
+            block_cnt=int(c_stats.get("blockCnt") or 0),
+            is_arts=(dmg_t == "arts"),
+            upgrade_num=int(c.get("upgradeNum") or 3),
         )
 
     item_meta: dict[str, ItemMeta] = {}
     for iid, it in items_raw.items():
+        gb = it.get("giveBondId")
         item_meta[iid] = ItemMeta(
             entity_idx=_register(iid),
             item_idx=item_to_idx[iid],
             tier=int(it.get("tier") or 0),
             is_golden=bool(it.get("isGolden")),
             price=int(it.get("price") or 0),
+            mergeable=bool(it.get("mergeable")),
+            upgrade_num=int(it.get("upgradeNum") or 0),
+            give_bond_idx=bond_to_idx.get(gb, -1) if isinstance(gb, str) else -1,
+            can_give_bond=bool(it.get("canGiveBond")),
+        )
+
+    enemy_meta: dict[str, EnemyMeta] = {}
+    for eid, e in enemies_raw.items():
+        st = e.get("stats") or {}
+        dt = str(st.get("dmgType") or "").lower()
+        dts = [str(x).lower() for x in (st.get("dmgTypes") or ())]
+        aw = str(e.get("applyWay") or "").upper()
+        enemy_meta[eid] = EnemyMeta(
+            max_hp=float(st.get("maxHp") or 0.0),
+            atk=float(st.get("atk") or 0.0),
+            def_=float(st.get("def") or 0.0),
+            res=float(st.get("res") or 0.0),
+            move_speed=float(st.get("moveSpeed") or 0.0),
+            lpr=int(st.get("lpr") if st.get("lpr") is not None else 1),
+            is_arts=(dt == "arts" or "arts" in dts),
+            is_ranged=(aw in ("RANGED", "ALL")),
+        )
+
+    boss_meta: dict[str, BossMeta] = {}
+    for bid, b in bosses_raw.items():
+        bbm = {str(k): float(v) for k, v in (b.get("bloodByMode") or {}).items() if v is not None}
+        bbd = {str(k): float(v) for k, v in (b.get("bloodPoint") or {}).items() if v is not None}
+        boss_meta[bid] = BossMeta(
+            enemy_key=str(b.get("enemyKey") or ""),
+            blood_by_mode=bbm,
+            blood_by_diff=bbd,
+            lpr=int(b.get("lpr") if b.get("lpr") is not None else 1),
         )
 
     token_pos_class = {tid: _pos_to_int(t.get("position")) for tid, t in tokens_raw.items()}
@@ -380,11 +475,27 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
     }
 
     mode_boss_weights: dict[str, tuple[tuple[str, float], ...]] = {}
+    mode_enemy_scale: dict[str, dict[int, tuple[float, float, float]]] = {}
     for mid, mcfg in (config_raw.get("modes") or {}).items():
         bw = mcfg.get("bossWeights") or {}
         pairs = tuple((str(bid), float(w)) for bid, w in bw.items() if float(w) > 0.0)
         if pairs:
             mode_boss_weights[str(mid)] = pairs
+        es = mcfg.get("enemyScale") or {}
+        if isinstance(es, dict) and es:
+            sc_map: dict[int, tuple[float, float, float]] = {}
+            for rk, rv in es.items():
+                if isinstance(rv, dict):
+                    try:
+                        sc_map[int(rk)] = (
+                            float(rv.get("atk", 1.0)),
+                            float(rv.get("hp", 1.0)),
+                            float(rv.get("speed", 1.0)),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            if sc_map:
+                mode_enemy_scale[str(mid)] = sc_map
 
     return GameCatalog(
         entity_to_idx=entity_to_idx,
@@ -394,6 +505,7 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
         bond_ids=bond_ids,
         bond_to_idx=bond_to_idx,
         core_bond_mask=core_bond_mask,
+        core_bond_indices=core_bond_indices,
         band_ids=band_ids,
         band_to_idx=band_to_idx,
         faction_ids=faction_ids,
@@ -403,6 +515,9 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
         stage_boss_spatial=stage_boss_spatial,
         chess_meta=chess_meta,
         item_meta=item_meta,
+        enemy_meta=enemy_meta,
+        boss_meta=boss_meta,
         token_pos_class=token_pos_class,
         mode_boss_weights=mode_boss_weights,
+        mode_enemy_scale=mode_enemy_scale,
     )
