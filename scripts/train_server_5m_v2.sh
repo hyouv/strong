@@ -22,6 +22,7 @@
 #
 # Usage:
 #   ./scripts/train_server_5m_v2.sh all                 # Full pipeline: bc -> normal -> hard -> abyss (~12.5h)
+#   ./scripts/train_server_5m_v2.sh ppo                 # Stages 2-4: normal -> hard -> abyss (reuses BC ckpt)
 #   ./scripts/train_server_5m_v2.sh bc                  # Stage 1: Unified 1-8 BC cold-start (~15m)
 #   ./scripts/train_server_5m_v2.sh normal              # Stage 2: NORMAL (L5-8 + mix L1-4) PPO (~3.7h)
 #   ./scripts/train_server_5m_v2.sh hard                # Stage 3: HARD (L9-14 + mix L1-8) PPO (~2.8h)
@@ -116,8 +117,9 @@ NORMAL_LR="${NORMAL_LR:-2.5e-5}"
 NORMAL_LR_END="${NORMAL_LR_END:-4e-6}"
 NORMAL_ENT_COEF="${NORMAL_ENT_COEF:-0.004}"
 NORMAL_ENT_COEF_END="${NORMAL_ENT_COEF_END:-0.0008}"
-NORMAL_STRATEGIC_ENT_COEF="${NORMAL_STRATEGIC_ENT_COEF:-0.015}"
-NORMAL_STRATEGIC_ENT_COEF_END="${NORMAL_STRATEGIC_ENT_COEF_END:-0.005}"
+# Note: strat_ent_bonus divides by n_strat (~1.4% of batch, ~70x amp vs policy_loss), so keep s_ent_c ~0.0004-0.0006
+NORMAL_STRATEGIC_ENT_COEF="${NORMAL_STRATEGIC_ENT_COEF:-0.0006}"
+NORMAL_STRATEGIC_ENT_COEF_END="${NORMAL_STRATEGIC_ENT_COEF_END:-0.00015}"
 NORMAL_KL_COEF="${NORMAL_KL_COEF:-0.04}"
 NORMAL_KL_COEF_END="${NORMAL_KL_COEF_END:-0.0}"
 NORMAL_KL_ANNEAL_UPDATES="${NORMAL_KL_ANNEAL_UPDATES:-100}"
@@ -140,8 +142,8 @@ HARD_LR="${HARD_LR:-2.5e-5}"
 HARD_LR_END="${HARD_LR_END:-4e-6}"
 HARD_ENT_COEF="${HARD_ENT_COEF:-0.004}"
 HARD_ENT_COEF_END="${HARD_ENT_COEF_END:-0.0008}"
-HARD_STRATEGIC_ENT_COEF="${HARD_STRATEGIC_ENT_COEF:-0.012}"
-HARD_STRATEGIC_ENT_COEF_END="${HARD_STRATEGIC_ENT_COEF_END:-0.004}"
+HARD_STRATEGIC_ENT_COEF="${HARD_STRATEGIC_ENT_COEF:-0.0005}"
+HARD_STRATEGIC_ENT_COEF_END="${HARD_STRATEGIC_ENT_COEF_END:-0.00012}"
 HARD_KL_COEF="${HARD_KL_COEF:-0.025}"
 HARD_KL_COEF_END="${HARD_KL_COEF_END:-0.0}"
 HARD_KL_ANNEAL_UPDATES="${HARD_KL_ANNEAL_UPDATES:-80}"
@@ -164,8 +166,8 @@ ABYSS_LR="${ABYSS_LR:-2.5e-5}"
 ABYSS_LR_END="${ABYSS_LR_END:-3e-6}"
 ABYSS_ENT_COEF="${ABYSS_ENT_COEF:-0.004}"
 ABYSS_ENT_COEF_END="${ABYSS_ENT_COEF_END:-0.0006}"
-ABYSS_STRATEGIC_ENT_COEF="${ABYSS_STRATEGIC_ENT_COEF:-0.010}"
-ABYSS_STRATEGIC_ENT_COEF_END="${ABYSS_STRATEGIC_ENT_COEF_END:-0.0025}"
+ABYSS_STRATEGIC_ENT_COEF="${ABYSS_STRATEGIC_ENT_COEF:-0.0004}"
+ABYSS_STRATEGIC_ENT_COEF_END="${ABYSS_STRATEGIC_ENT_COEF_END:-0.00008}"
 ABYSS_KL_COEF="${ABYSS_KL_COEF:-0.025}"
 ABYSS_KL_COEF_END="${ABYSS_KL_COEF_END:-0.0}"
 ABYSS_KL_ANNEAL_UPDATES="${ABYSS_KL_ANNEAL_UPDATES:-100}"
@@ -484,6 +486,11 @@ run_eval() {
     eval_normal) run_eval tier2 "${2:-${NORMAL_BEST_CKPT}}" "${NORMAL_EVAL_EPISODES}" "${NORMAL_EVAL_SEED_START}" ;;
     eval_hard)   run_eval tier3 "${2:-${HARD_BEST_CKPT}}" "${HARD_EVAL_EPISODES}" "${HARD_EVAL_SEED_START}" ;;
     eval_abyss)  run_eval tier4 "${2:-${ABYSS_BEST_CKPT}}" "${ABYSS_EVAL_EPISODES}" "${ABYSS_EVAL_SEED_START}" ;;
+    ppo)
+      run_normal
+      run_hard
+      run_abyss
+      ;;
     all)
       run_bc
       run_normal
@@ -491,7 +498,7 @@ run_eval() {
       run_abyss
       ;;
     *)
-      echo "Usage: $0 [all|bc|normal|hard|abyss|eval_normal [ckpt]|eval_hard [ckpt]|eval_abyss [ckpt]]" >&2
+      echo "Usage: $0 [all|ppo|bc|normal|hard|abyss|eval_normal [ckpt]|eval_hard [ckpt]|eval_abyss [ckpt]]" >&2
       exit 2
       ;;
   esac
