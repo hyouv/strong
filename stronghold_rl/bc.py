@@ -30,13 +30,15 @@ from .codec import (
     TYPE_CHOICE,
     TYPE_COMMAND_CHOICE,
     TYPE_DESTROY,
+    TYPE_FREEZE,
+    TYPE_MOVE,
     TYPE_READY,
     TYPE_SELL,
     EncodedFrame,
     encode_frame,
 )
 from .model import PolicyConfig, StrongholdPolicyNet, extract_step_masks
-from .rollout import AsyncActorPool
+from .rollout import AsyncActorPool, prep_state_signature
 
 
 def resolve_device(device_arg: str) -> str:
@@ -81,29 +83,21 @@ def pick_force_unblock_action(enc: EncodedFrame) -> int:
     return 0
 
 
-def _prep_state_signature(frame: Mapping[str, Any]) -> tuple[Any, ...]:
-    """Compact signature of observable PREP state for detecting deterministic move/freeze cycles."""
-    own = frame["own"]
-    shop = own.get("shop") or {}
-    board = tuple(
-        sorted(
-            (int(p["uid"]), int(p["row"]), int(p["col"]), p.get("dir", "RIGHT"), len(p.get("items") or []))
-            for p in (own.get("board") or [])
-            if p
-        )
-    )
-    hand = tuple(int(p["uid"]) if p else None for p in (own.get("hand") or []))
-    temp = tuple(int(p["uid"]) if p else None for p in (own.get("temp") or []))
-    shop_sold = tuple(bool(s.get("sold")) if s else None for s in (shop.get("slots") or []))
-    return (
-        int(own.get("funds") or 0),
-        int(shop.get("level") or 1),
-        bool(shop.get("frozen")),
-        shop_sold,
-        board,
-        hand,
-        temp,
-    )
+_prep_state_signature = prep_state_signature
+
+
+def _mask_encoded_cycle_actions(enc: EncodedFrame) -> tuple[EncodedFrame, bool]:
+    """Return a shallow-copied EncodedFrame with MOVE/FREEZE masked off if other legal actions exist."""
+    tm = enc.action_tree.type_mask
+    if not bool(tm[TYPE_MOVE] or tm[TYPE_FREEZE]):
+        return enc, False
+    masked_tm = tm.clone()
+    masked_tm[TYPE_MOVE] = False
+    masked_tm[TYPE_FREEZE] = False
+    if not bool(masked_tm.any()):
+        return enc, False
+    masked_tree = replace(enc.action_tree, type_mask=masked_tm, _type_mask_bytes=None)
+    return replace(enc, action_tree=masked_tree), True
 
 
 @dataclass
@@ -746,11 +740,13 @@ def evaluate_policy_solo(
                     ep_steps[w] += 1
                     continue
 
+                req_det = use_det
+                req_temp = temperature if temperature > 0.0 else 1.0
                 if break_cycles and frame["phase"] == "PREP":
                     sig = _prep_state_signature(frame)
                     visits = ep_seen_sigs[w].get(sig, 0)
                     ep_seen_sigs[w][sig] = visits + 1
-                    if visits >= 2 and bool(enc.action_tree.type_mask[TYPE_READY]):
+                    if visits >= 3 and bool(enc.action_tree.type_mask[TYPE_READY]):
                         cycle_breaks += 1
                         action_key = enc.action_tree.decode(TYPE_READY)
                         step_cmds[w] = {
@@ -764,16 +760,17 @@ def evaluate_policy_solo(
                         continue
                     if visits >= 1:
                         cycle_breaks += 1
-                        escape_temp = max(temperature, 0.6) if temperature > 0.0 else 0.6
-                        stoch_items.append((w, frame, enc, escape_temp))
-                        continue
+                        enc, masked = _mask_encoded_cycle_actions(enc)
+                        if visits >= 2 or not masked:
+                            req_det = False
+                            req_temp = max(temperature, 0.7) if temperature > 0.0 else 0.7
 
-                if use_det:
+                if req_det:
                     det_workers.append(w)
                     det_frames.append(frame)
                     det_encs.append(enc)
                 else:
-                    stoch_items.append((w, frame, enc, temperature if temperature > 0.0 else 1.0))
+                    stoch_items.append((w, frame, enc, req_temp))
 
             if det_encs:
                 acts = model.act_batch(det_encs, deterministic=True, device=device)

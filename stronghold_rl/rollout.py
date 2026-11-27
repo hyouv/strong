@@ -40,6 +40,8 @@ from .codec import (
     TYPE_BOND_GROUP,
     TYPE_CHOICE,
     TYPE_COMMAND_CHOICE,
+    TYPE_FREEZE,
+    TYPE_MOVE,
     TYPE_READY,
     ActionMaskSpec,
     FastActionDecoder,
@@ -100,27 +102,69 @@ def _make_shm_arrays(
     return cat_arr, cont_arr, valid_arr
 
 
-def _prep_state_signature_local(frame: Mapping[str, Any]) -> tuple[Any, ...]:
+def prep_state_signature(frame: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Observable PREP state signature for detecting move/freeze oscillation cycles."""
     own = frame["own"]
     shop = own.get("shop") or {}
     board = tuple(
         sorted(
-            (int(p["uid"]), int(p["row"]), int(p["col"]), p.get("dir", "RIGHT"), len(p.get("items") or ()))
+            (
+                int(p["uid"]),
+                int(p["row"]),
+                int(p["col"]),
+                p.get("dir", "RIGHT"),
+                tuple(str(it.get("id") or "") for it in (p.get("items") or ())),
+            )
             for p in (own.get("board") or ())
             if p
         )
     )
     hand = tuple(int(p["uid"]) if p else None for p in (own.get("hand") or ()))
     temp = tuple(int(p["uid"]) if p else None for p in (own.get("temp") or ()))
-    shop_sold = tuple(bool(s.get("sold")) if s else None for s in (shop.get("slots") or ()))
+    shop_slots = tuple(
+        (str(s.get("id") or ""), bool(s.get("sold")), bool(s.get("frozen"))) if s else None
+        for s in (shop.get("slots") or ())
+    )
+    reward_offer = shop.get("rewardOffer") or {}
+    reward_slots = tuple(
+        (str(s.get("id") or ""), bool(s.get("sold"))) if s else None
+        for s in (reward_offer.get("slots") or ())
+    )
     return (
         int(own.get("funds") or 0),
         int(shop.get("level") or 1),
+        int(shop.get("freeRefreshes") or 0),
         bool(shop.get("frozen")),
-        shop_sold,
+        shop_slots,
+        reward_slots,
         board,
         hand,
         temp,
+    )
+
+
+_prep_state_signature_local = prep_state_signature
+
+
+def mask_cycle_action_types(mask_spec: ActionMaskSpec) -> tuple[ActionMaskSpec, bool]:
+    """Suppress oscillating MOVE/FREEZE types when at least one other legal action type exists."""
+    tm = bytearray(mask_spec.type_mask_bytes)
+    had_osc = bool(tm[TYPE_MOVE] or tm[TYPE_FREEZE])
+    if not had_osc:
+        return mask_spec, False
+    tm[TYPE_MOVE] = 0
+    tm[TYPE_FREEZE] = 0
+    if not any(tm):
+        return mask_spec, False
+    return (
+        ActionMaskSpec(
+            type_mask_bytes=bytes(tm),
+            src_keys=mask_spec.src_keys,
+            tgt_keys=mask_spec.tgt_keys,
+            opt_bits=mask_spec.opt_bits,
+            num_bands=mask_spec.num_bands,
+        ),
+        True,
     )
 
 
@@ -227,13 +271,16 @@ def _actor_worker_main(
 
                 req_det = base_det
                 req_temp = base_temp
+                obs_mask_spec = dec.mask_spec
 
                 # Local fast-path 2: deterministic eval cycle-breaker
+                # Suppress oscillating MOVE/FREEZE on repeat visits instead of prematurely aborting prep
+                # with READY; only force READY if still trapped at visits >= 3.
                 if break_cycles and phase == "PREP":
-                    sig = _prep_state_signature_local(frame)
+                    sig = prep_state_signature(frame)
                     visits = ep_seen_sigs.get(sig, 0)
                     ep_seen_sigs[sig] = visits + 1
-                    if visits >= 2 and dec.mask_spec.type_mask_bytes[TYPE_READY]:
+                    if visits >= 3 and dec.mask_spec.type_mask_bytes[TYPE_READY]:
                         cycle_delta += 1
                         action_key = dec.decode(TYPE_READY)
                         ep_prep_steps += 1
@@ -243,8 +290,10 @@ def _actor_worker_main(
                         continue
                     if visits >= 1:
                         cycle_delta += 1
-                        req_det = False
-                        req_temp = max(base_temp, 0.6) if base_temp > 0.0 else 0.6
+                        obs_mask_spec, masked = mask_cycle_action_types(obs_mask_spec)
+                        if visits >= 2 or not masked:
+                            req_det = False
+                            req_temp = max(base_temp, 0.7) if base_temp > 0.0 else 0.7
 
                 cur_dec = dec
                 cur_decision_id = int(frame["decision_id"])
@@ -262,7 +311,7 @@ def _actor_worker_main(
                         pending_lp_lost,
                         forced_delta,
                         cycle_delta,
-                        dec.mask_spec,
+                        obs_mask_spec,
                     )
                 )
                 return

@@ -48,7 +48,7 @@ from stronghold_rl.ppo import (
     collect_ppo_rollouts,
     ppo_update,
 )
-from stronghold_rl.rollout import AsyncActorPool
+from stronghold_rl.rollout import AsyncActorPool, mask_cycle_action_types, prep_state_signature
 
 
 def test_solo_mode_codec_bijection_and_logprob_consistency() -> None:
@@ -478,3 +478,66 @@ def test_compact_protocol_and_fast_codec_exact_parity() -> None:
         assert f_comp.get("victory") == f_full.get("victory")
         assert f_comp.get("roundsPassed") == f_full.get("roundsPassed")
         assert steps > 50
+
+
+def test_prep_state_signature_and_cycle_masking() -> None:
+    """Free refreshes, shop slot changes, item swaps must change PREP signature; cycle escape masks MOVE/FREEZE."""
+    from stronghold_rl.codec import ActionMaskSpec, NUM_ACTION_TYPES, TYPE_BUY, TYPE_FREEZE, TYPE_MOVE, TYPE_READY
+
+    base_frame = {
+        "own": {
+            "funds": 8,
+            "shop": {
+                "level": 5,
+                "freeRefreshes": 2,
+                "frozen": False,
+                "slots": [
+                    {"id": "chess_a", "sold": False, "frozen": False},
+                    {"id": "chess_b", "sold": False, "frozen": False},
+                ],
+                "rewardOffer": None,
+            },
+            "board": [{"uid": 1, "row": 9, "col": 3, "dir": "RIGHT", "items": [{"id": "item_a"}]}],
+            "hand": [None, {"uid": 2}],
+            "temp": [None],
+        }
+    }
+    sig0 = prep_state_signature(base_frame)
+
+    # Free refresh changing shop entity IDs & freeRefreshes must produce a distinct signature
+    refreshed = copy.deepcopy(base_frame)
+    refreshed["own"]["shop"]["freeRefreshes"] = 1
+    refreshed["own"]["shop"]["slots"][0]["id"] = "chess_c"
+    assert prep_state_signature(refreshed) != sig0
+
+    # Replacing an equipped item with a different item of same count must change signature
+    swapped_item = copy.deepcopy(base_frame)
+    swapped_item["own"]["board"][0]["items"] = [{"id": "item_b"}]
+    assert prep_state_signature(swapped_item) != sig0
+
+    # Slot-level freeze must change signature
+    slot_frozen = copy.deepcopy(base_frame)
+    slot_frozen["own"]["shop"]["slots"][0]["frozen"] = True
+    assert prep_state_signature(slot_frozen) != sig0
+
+    # Cycle escape must mask MOVE & FREEZE while preserving productive BUY/READY actions
+    tm = bytearray(NUM_ACTION_TYPES)
+    tm[TYPE_READY] = 1
+    tm[TYPE_BUY] = 1
+    tm[TYPE_FREEZE] = 1
+    tm[TYPE_MOVE] = 1
+    spec = ActionMaskSpec(type_mask_bytes=bytes(tm), src_keys={}, tgt_keys={}, opt_bits={}, num_bands=61)
+    masked_spec, did_mask = mask_cycle_action_types(spec)
+    assert did_mask is True
+    assert masked_spec.type_mask_bytes[TYPE_MOVE] == 0
+    assert masked_spec.type_mask_bytes[TYPE_FREEZE] == 0
+    assert masked_spec.type_mask_bytes[TYPE_BUY] == 1
+    assert masked_spec.type_mask_bytes[TYPE_READY] == 1
+
+    # If ONLY MOVE is legal, masking must refuse to produce an all-zero mask
+    tm_only_move = bytearray(NUM_ACTION_TYPES)
+    tm_only_move[TYPE_MOVE] = 1
+    spec_only = ActionMaskSpec(type_mask_bytes=bytes(tm_only_move), src_keys={}, tgt_keys={}, opt_bits={}, num_bands=61)
+    same_spec, did_mask2 = mask_cycle_action_types(spec_only)
+    assert did_mask2 is False
+    assert same_spec.type_mask_bytes[TYPE_MOVE] == 1
