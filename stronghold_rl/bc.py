@@ -746,7 +746,7 @@ def evaluate_policy_solo(
                     sig = _prep_state_signature(frame)
                     visits = ep_seen_sigs[w].get(sig, 0)
                     ep_seen_sigs[w][sig] = visits + 1
-                    if visits >= 3 and bool(enc.action_tree.type_mask[TYPE_READY]):
+                    if visits >= 8 and bool(enc.action_tree.type_mask[TYPE_READY]):
                         cycle_breaks += 1
                         action_key = enc.action_tree.decode(TYPE_READY)
                         step_cmds[w] = {
@@ -758,12 +758,16 @@ def evaluate_policy_solo(
                         ep_prep_steps[w] += 1
                         ep_steps[w] += 1
                         continue
-                    if visits >= 1:
+                    if visits >= 6:
                         cycle_breaks += 1
                         enc, masked = _mask_encoded_cycle_actions(enc)
-                        if visits >= 2 or not masked:
+                        if visits >= 7 or not masked:
                             req_det = False
                             req_temp = max(temperature, 0.7) if temperature > 0.0 else 0.7
+                    elif visits >= 4:
+                        cycle_breaks += 1
+                        req_det = False
+                        req_temp = max(temperature, 0.7) if temperature > 0.0 else 0.7
 
                 if req_det:
                     det_workers.append(w)

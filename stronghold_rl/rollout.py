@@ -357,13 +357,16 @@ def _actor_worker_main(
                     )
 
                 # Local fast-path 2: deterministic eval cycle-breaker
-                # Suppress oscillating MOVE/FREEZE on repeat visits instead of prematurely aborting prep
-                # with READY; only force READY if still trapped at visits >= 3.
+                # Because `prep_steps` is an observed feature, 1-3 revisits can be legitimate repositioning
+                # before the policy shifts to BUY/REFRESH/EQUIP. Only intervene on genuine stuck loops:
+                #   visits 4..5 -> stochastic escape (T=0.7) without banning MOVE
+                #   visits 6..7 -> mask oscillating MOVE/FREEZE
+                #   visits >= 8 -> hard-unblock via READY
                 if break_cycles and phase == "PREP":
                     sig = prep_state_signature(frame)
                     visits = ep_seen_sigs.get(sig, 0)
                     ep_seen_sigs[sig] = visits + 1
-                    if visits >= 3 and dec.mask_spec.type_mask_bytes[TYPE_READY]:
+                    if visits >= 8 and dec.mask_spec.type_mask_bytes[TYPE_READY]:
                         cycle_delta += 1
                         action_key = dec.decode(TYPE_READY)
                         ep_prep_steps += 1
@@ -371,12 +374,16 @@ def _actor_worker_main(
                         assert client is not None
                         frame = client.step(frame["decision_id"], action_key, policy_version=0)
                         continue
-                    if visits >= 1:
+                    if visits >= 6:
                         cycle_delta += 1
                         obs_mask_spec, masked = mask_cycle_action_types(obs_mask_spec)
-                        if visits >= 2 or not masked:
+                        if visits >= 7 or not masked:
                             req_det = False
                             req_temp = max(base_temp, 0.7) if base_temp > 0.0 else 0.7
+                    elif visits >= 4:
+                        cycle_delta += 1
+                        req_det = False
+                        req_temp = max(base_temp, 0.7) if base_temp > 0.0 else 0.7
                 elif track_repeat_states and phase == "PREP":
                     sig = prep_state_signature(frame)
                     visits = ep_seen_sigs.get(sig, 0)
