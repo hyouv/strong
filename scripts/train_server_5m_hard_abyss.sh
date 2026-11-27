@@ -141,8 +141,14 @@ ABYSS_V2_CKPT="${ABYSS_V2_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_v2_last.pt}"
 ABYSS_V2_BEST_CKPT="${ABYSS_V2_BEST_CKPT:-checkpoints/ppo_5m_solo_t4_abyss_v2_best.pt}"
 
 EVAL_EVERY="${EVAL_EVERY:-20}"
-SAVE_EVERY="${SAVE_EVERY:-10}"
 EVAL_TEMP="${EVAL_TEMP:-0.0}"
+EVAL_BREAK_CYCLES="${EVAL_BREAK_CYCLES:-0}" # 0 passes --no-break-cycles (faster, exact deterministic, +4.6% on ABYSS)
+SAVE_EVERY="${SAVE_EVERY:-10}"
+
+EVAL_EXTRA_ARGS=()
+if [[ "${EVAL_BREAK_CYCLES}" == "0" ]]; then
+  EVAL_EXTRA_ARGS+=(--no-break-cycles)
+fi
 
 mkdir -p data checkpoints logs
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -259,6 +265,7 @@ run_abyss() {
     --save-every "${SAVE_EVERY}" \
     --eval-seed-start "${ABYSS_EVAL_SEED_START}" \
     --eval-temp "${EVAL_TEMP}" \
+    "${EVAL_EXTRA_ARGS[@]}" \
     --out "${ABYSS_CKPT}" \
     --best-out "${ABYSS_BEST_CKPT}"
 }
@@ -323,6 +330,7 @@ run_resume_abyss() {
     --save-every "${SAVE_EVERY}" \
     --eval-seed-start "${ABYSS_EVAL_SEED_START}" \
     --eval-temp "${EVAL_TEMP}" \
+    "${EVAL_EXTRA_ARGS[@]}" \
     --out "${ABYSS_V2_CKPT}" \
     --best-out "${ABYSS_V2_BEST_CKPT}"
 }
@@ -340,6 +348,7 @@ run_eval() {
     --eval-workers "${PPO_WORKERS}" \
     --eval-seed-start "${seed_start}" \
     --eval-temp "${EVAL_TEMP}" \
+    "${EVAL_EXTRA_ARGS[@]}" \
     --device "${DEVICE}"
 }
 
