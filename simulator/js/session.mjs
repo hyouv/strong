@@ -121,6 +121,7 @@ function compactOwn(own) {
             command: !!e.command,
             commandType: e.commandType || null,
             iconKind: e.iconKind || null,
+            ...(e.iconId ? { iconId: e.iconId } : {}),
             ...(e.counter != null ? { counter: e.counter } : {}),
             ...(e.progress ? { progress: e.progress } : {}),
             ...(e.roundProgress ? { roundProgress: e.roundProgress } : {}),

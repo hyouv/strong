@@ -273,6 +273,9 @@ test('RoomSession compact mode reports bossId/bossDmgRatio and supports valid bo
         assert.ok(frame.own.nextEnemies.every((e) => e.source === 'wave' || e.source === 'bounty'));
         sawNextEnemiesSource = true;
       }
+      if (frame.own?.effects?.length) {
+        assert.ok(frame.own.effects.every((e) => !e || typeof e.iconId === 'string'));
+      }
       let choice = 0;
       for (const code of order) {
         const idx = frame.cactions.findIndex((a) => a[0] === code);
