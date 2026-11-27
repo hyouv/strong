@@ -1,4 +1,42 @@
-# 从现有最佳权重续训多阵营开局
+# 多阵营开局训练
+
+## 从头训练，首轮启用随机掩码
+
+```bash
+cd /data/exp/sp
+RUN_ID="$(date +%Y%m%d_%H%M%S)" \
+DEVICE=cuda:0 bash scripts/train_server_diversity_scratch.sh all
+```
+
+完整执行 **全新 BC → NORMAL（等级 5–8）→ HARD（9–14）→ ABYSS（15–20）**。
+BC 从随机初始化的模型开始，可以复用已有专家数据缓存，但不加载任何旧模型权重。
+BC 是监督学习，不应用 PPO 采样掩码；**第一次 PPO 采样起（包括 5 次 Critic 热身）**即使用：
+
+- 50% 对局随机限制开局，另外 50% 对局自由选择。
+- 受限局随机保留一个盟约组、35% 的合法策略（61 个时保留 22 个）。
+- `mask_p=0.500`、`band_keep=0.350` 全程固定，三个 PPO 阶段均不再从弱限制渐增。
+- 回合内 `lambda=1.0`，评测不加训练掩码，保留盟约熵和策略熵的分别监控。
+
+PPO 更新次数沿用原完整训练配置：NORMAL 360、HARD 240、ABYSS 500，
+每阶段前 5 次只训练 Critic；其他学习率、熵奖励和难度混合配置沿用 `train_server_5m_v2.sh`。
+这与下面的旧权重微调脚本不同。
+
+输出独立保存在：
+
+```text
+logs/diversity_scratch_<RUN_ID>_all.log
+checkpoints/diversity_scratch_<RUN_ID>_bc.pt
+checkpoints/diversity_scratch_<RUN_ID>_{normal,hard,abyss}_{last,best}.pt
+```
+
+NORMAL 读取本次 BC，HARD 读取本次 NORMAL best，ABYSS 读取本次 HARD best；
+脚本会覆盖环境中残留的 `NORMAL_INIT_CKPT` 等续训输入，且拒绝覆盖已存在的输出权重。
+分阶段运行 `bc`、`ppo` 或 `normal|hard|abyss` 时，要显式传入**同一个 `RUN_ID`**，
+才能找到本次训练的前置权重；这些入口开始新的阶段，不恢复中断阶段的优化器。
+需要每局都随机受限时，可加 `PPO_OPENING_MASK_PROB_START=1.0`（END 默认跟随 START）；
+默认保留一半自由选择对局，用于训练最终无掩码评测时的开局决策。
+
+## 从现有最佳权重渐进续训
 
 服务器目录 `/data/exp/sp`。以下命令由操作者手动执行，前台输出同时保存到日志。
 

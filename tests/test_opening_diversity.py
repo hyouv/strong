@@ -252,3 +252,54 @@ def test_finetune_launcher_builds_expected_command_without_training(tmp_path: Pa
     assert value("--out") == "checkpoints/diversity_normal_test_last.pt"
     assert value("--best-out") == "checkpoints/diversity_normal_test_best.pt"
     assert value("--seed") == "1210000"
+
+
+def test_scratch_launcher_chains_fresh_weights_and_masks_from_warmup(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    fake_python = tmp_path / "capture-python"
+    capture = tmp_path / "args.jsonl"
+    fake_python.write_text(
+        f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
+        "if '-m' in sys.argv:\n"
+        " with open(os.environ['CAPTURE_ARGS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        " for flag in ('--out', '--best-out'):\n"
+        "  if flag in sys.argv: Path(sys.argv[sys.argv.index(flag) + 1]).touch()\n"
+    )
+    fake_python.chmod(0o755)
+    env = dict(os.environ, ROOT_DIR=str(tmp_path), PYTHON_BIN=str(fake_python),
+               CAPTURE_ARGS=str(capture), RUN_ID="test", INIT_CKPT="old.pt",
+               NORMAL_INIT_CKPT="old.pt", HARD_INIT_CKPT="old.pt", ABYSS_INIT_CKPT="old.pt")
+    command = ["bash", str(root / "scripts/train_server_diversity_scratch.sh"), "all"]
+    subprocess.run(command, env=env, check=True, capture_output=True, text=True)
+    commands = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len(commands) == 4
+    bc, *ppo_commands = commands
+    assert bc[bc.index("-m") + 1] == "stronghold_rl.bc"
+    assert "--init-ckpt" not in bc
+    previous = bc[bc.index("--out") + 1]
+    assert previous == "checkpoints/diversity_scratch_test_bc.pt"
+    for stage, args in zip(("normal", "hard", "abyss"), ppo_commands):
+        def value(flag):
+            return args[args.index(flag) + 1]
+        assert value("--init-ckpt") == previous
+        assert value("--out") == f"checkpoints/diversity_scratch_test_{stage}_last.pt"
+        assert value("--best-out") == f"checkpoints/diversity_scratch_test_{stage}_best.pt"
+        assert value("--gae-lambda-intra") == "1.0"
+        assert value("--opening-mask-prob-start") == value("--opening-mask-prob-end") == "0.5"
+        assert value("--opening-band-keep-start") == value("--opening-band-keep-end") == "0.35"
+        for update in (1, 5, 6, int(value("--updates"))):
+            assert opening_mask_schedule(
+                update, warmup_updates=int(value("--critic-warmup")),
+                anneal_updates=int(value("--opening-mask-anneal-updates")),
+                prob_start=float(value("--opening-mask-prob-start")),
+                prob_end=float(value("--opening-mask-prob-end")),
+                keep_start=float(value("--opening-band-keep-start")),
+                keep_end=float(value("--opening-band-keep-end")),
+            ) == (0.5, 0.35)
+        previous = value("--best-out")
+
+    # Reusing a run identifier must fail before any training process is invoked.
+    repeated = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert repeated.returncode == 1
+    assert "output already exists" in repeated.stderr
+    assert len(capture.read_text().splitlines()) == 4
