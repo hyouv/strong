@@ -259,13 +259,20 @@ test('RoomSession compact mode reports bossId/bossDmgRatio and supports valid bo
   try {
     let frame = session.reset(5555, 'mode_single_15', 0, true, 'boss_17');
     assert.equal(frame.pub.bossId, 'boss_17');
+    assert.equal(frame.pub.modeId, 'mode_single_15');
+    assert.ok(frame.own.stats && typeof frame.own.stats.leaks === 'number');
     assert.throws(() => session.reset(5555, 'mode_single_15', 0, true, 'boss_nonexistent'), /Invalid bossId/);
 
     frame = session.reset(5555, 'mode_single_15', 0, true, 'boss_17');
     const order = [15, 16, 18, 13, 12, 0, 2, 8]; // compact action type codes: infoReady, band, diyBring, choice, cmdChoice, ready, sell, destroy
     let steps = 0;
+    let sawNextEnemiesSource = false;
     while (!frame.terminal) {
       assert.ok(steps < 3000, 'Match exceeded step guard');
+      if (frame.own?.nextEnemies?.length) {
+        assert.ok(frame.own.nextEnemies.every((e) => e.source === 'wave' || e.source === 'bounty'));
+        sawNextEnemiesSource = true;
+      }
       let choice = 0;
       for (const code of order) {
         const idx = frame.cactions.findIndex((a) => a[0] === code);
@@ -274,6 +281,7 @@ test('RoomSession compact mode reports bossId/bossDmgRatio and supports valid bo
       frame = session.step({ decision_id: frame.decision_id, action_key: choice, policy_version: 0 });
       steps++;
     }
+    assert.equal(sawNextEnemiesSource, true);
     assert.equal(frame.bossId, 'boss_17');
     assert.equal(typeof frame.bossDmgRatio, 'number');
     assert.ok(frame.bossDmgRatio >= 0 && frame.bossDmgRatio <= 1);

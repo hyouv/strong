@@ -23,8 +23,16 @@ function compactPiece(p) {
   if (p.col != null) out.col = p.col;
   if (p.dir) out.dir = p.dir;
   if (p.ownerUid != null) out.ownerUid = p.ownerUid;
+  if (p.progress) out.progress = p.progress;
+  if (p.showTag) out.showTag = p.showTag;
+  if (p.garrisonTags) out.garrisonTags = p.garrisonTags;
   if (items && items.length) {
-    out.items = items.map((it) => ({ uid: it.uid, id: it.id }));
+    out.items = items.map((it) => ({
+      uid: it.uid,
+      id: it.id,
+      ...(it.progress ? { progress: it.progress } : {}),
+      ...(it.showTag ? { showTag: it.showTag } : {}),
+    }));
   }
   return out;
 }
@@ -49,6 +57,7 @@ function compactPub(pub) {
     bossRound: pub.bossRound,
     hiddenRound: pub.hiddenRound,
     spRound: !!pub.spRound,
+    modeId: pub.modeId,
     difficulty: pub.difficulty,
     stageId: pub.stageId,
     factions: pub.factions,
@@ -105,13 +114,16 @@ function compactOwn(own) {
           targetType: cmd.targetType || null,
         }
       : null,
-    effects: (own.effects || []).slice(0, 6).map((e) =>
+    effects: (own.effects || []).map((e) =>
       e
         ? {
             id: e.id,
             command: !!e.command,
             commandType: e.commandType || null,
             iconKind: e.iconKind || null,
+            ...(e.counter != null ? { counter: e.counter } : {}),
+            ...(e.progress ? { progress: e.progress } : {}),
+            ...(e.roundProgress ? { roundProgress: e.roundProgress } : {}),
           }
         : null
     ),
@@ -140,7 +152,16 @@ function compactOwn(own) {
       fly: !!e.fly,
       elite: !!e.elite,
       boss: !!e.boss,
+      source: e.source || 'wave',
+      ...(Array.isArray(e.start) ? { start: e.start } : {}),
     })),
+    stats: own.stats
+      ? {
+          leaks: own.stats.leaks || 0,
+          kills: own.stats.kills || 0,
+          merges: own.stats.merges || 0,
+        }
+      : null,
   };
 }
 
