@@ -39,6 +39,7 @@ import torch
 from .catalog import (
     BOARD_COLS,
     BOARD_TILES,
+    BOSS_ROW_OFFSET,
     DIFF_TO_IDX,
     DIR_TO_IDX,
     FIELD_C0,
@@ -823,6 +824,8 @@ def _fill_features_numpy(
     is_boss = rnd >= boss_round
     is_hidden = rnd >= hidden_round
     stage_id = pub.get("stageId")
+    mode_id = pub.get("modeId")
+    difficulty = pub.get("difficulty") or "FUNNY"
 
     # Fast copy of precomputed static stage/board/slot/bond template
     cat_base, cont_base, valid_base = _get_stage_template(cat, stage_id, is_boss)
@@ -833,10 +836,13 @@ def _fill_features_numpy(
     log1p = math.log1p
     chess_meta = cat.chess_meta
     item_meta = cat.item_meta
+    enemy_meta = cat.enemy_meta
     entity_idx_fn = cat.entity_idx
     item_idx_fn = cat.item_idx
     token_pos_class = cat.token_pos_class
     dir_to_idx = DIR_TO_IDX
+    spatial_grid = cat.stage_spatial(stage_id, is_boss=is_boss)
+    atk_scale, hp_scale, spd_scale = cat.enemy_scale(mode_id, max(1, rnd))
 
     stats_by_uid: dict[int, Mapping[str, Any]] = {}
     if detail:
@@ -849,6 +855,8 @@ def _fill_features_numpy(
 
     owned_base_counts: dict[int, int] = {}
     owned_item_counts: dict[int, int] = {}
+    owned_item_merge_counts: dict[int, int] = {}
+    board_base_indices: set[int] = set()
     board_uids: set[int] = set()
     uid_to_token: dict[int, int] = {}
     uid_to_items: dict[int, list[int]] = {}
@@ -860,56 +868,140 @@ def _fill_features_numpy(
     for p in board_list:
         if p:
             board_uids.add(int(p["uid"]))
-            if not p.get("golden"):
-                kind = p.get("kind")
-                if kind == "chess":
-                    cm = chess_meta.get(p.get("id"))
-                    if cm:
+            kind = p.get("kind")
+            if kind == "chess":
+                cm = chess_meta.get(p.get("id"))
+                if cm:
+                    board_base_indices.add(cm.base_idx)
+                    if not p.get("golden"):
                         bi = cm.base_idx
                         owned_base_counts[bi] = owned_base_counts.get(bi, 0) + 1
-                elif kind == "item":
+                for eq_it in p.get("items") or ():
+                    im = item_meta.get(eq_it.get("id"))
+                    if im and not im.is_golden:
+                        ei = im.entity_idx
+                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+            elif kind == "item" and not p.get("golden"):
+                im = item_meta.get(p.get("id"))
+                if im:
+                    ei = im.entity_idx
+                    owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
+                    owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+    free_hand = 0
+    unequipped_item_cnt = 0
+    for p in hand_list:
+        if p is None:
+            free_hand += 1
+        else:
+            kind = p.get("kind")
+            if kind == "item":
+                unequipped_item_cnt += 1
+                if not p.get("golden"):
                     im = item_meta.get(p.get("id"))
                     if im:
                         ei = im.entity_idx
                         owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
-    free_hand = 0
-    for p in hand_list:
-        if p is None:
-            free_hand += 1
-        elif not p.get("golden"):
-            kind = p.get("kind")
-            if kind == "chess":
-                cm = chess_meta.get(p.get("id"))
-                if cm:
-                    bi = cm.base_idx
-                    owned_base_counts[bi] = owned_base_counts.get(bi, 0) + 1
-            elif kind == "item":
-                im = item_meta.get(p.get("id"))
-                if im:
-                    ei = im.entity_idx
-                    owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
+                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+            elif kind == "chess":
+                if not p.get("golden"):
+                    cm = chess_meta.get(p.get("id"))
+                    if cm:
+                        bi = cm.base_idx
+                        owned_base_counts[bi] = owned_base_counts.get(bi, 0) + 1
+                for eq_it in p.get("items") or ():
+                    im = item_meta.get(eq_it.get("id"))
+                    if im and not im.is_golden:
+                        ei = im.entity_idx
+                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
     free_temp = 0
     for p in temp_list:
         if p is None:
             free_temp += 1
-        elif not p.get("golden"):
+        else:
             kind = p.get("kind")
-            if kind == "chess":
-                cm = chess_meta.get(p.get("id"))
-                if cm:
-                    bi = cm.base_idx
-                    owned_base_counts[bi] = owned_base_counts.get(bi, 0) + 1
-            elif kind == "item":
-                im = item_meta.get(p.get("id"))
-                if im:
-                    ei = im.entity_idx
-                    owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
+            if kind == "item":
+                unequipped_item_cnt += 1
+                if not p.get("golden"):
+                    im = item_meta.get(p.get("id"))
+                    if im:
+                        ei = im.entity_idx
+                        owned_item_counts[ei] = owned_item_counts.get(ei, 0) + 1
+                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+            elif kind == "chess":
+                if not p.get("golden"):
+                    cm = chess_meta.get(p.get("id"))
+                    if cm:
+                        bi = cm.base_idx
+                        owned_base_counts[bi] = owned_base_counts.get(bi, 0) + 1
+                for eq_it in p.get("items") or ():
+                    im = item_meta.get(eq_it.get("id"))
+                    if im and not im.is_golden:
+                        ei = im.entity_idx
+                        owned_item_merge_counts[ei] = owned_item_merge_counts.get(ei, 0) + 1
+
+    # ---- Pre-pass [80..105] BONDS dynamic state & macro synergy summary ----
+    bond_to_idx = cat.bond_to_idx
+    core_bond_mask = cat.core_bond_mask
+    total_activated_layers = 0
+    active_core_cnt = 0
+    max_core_tier = 0
+    active_addon_cnt = 0
+    active_core_bonds: set[int] = set()
+    bond_counts: dict[int, int] = {}
+    bond_next_delta: dict[int, int] = {}
+
+    for bid in pub.get("disabledBonds") or ():
+        bi = bond_to_idx.get(bid)
+        if bi is not None:
+            cont_np[BOND_OFFSET + bi, 1] = 1.0
+    for b in own.get("bonds") or ():
+        bi = bond_to_idx.get(b["bondId"])
+        if bi is None:
+            continue
+        f = cont_np[BOND_OFFSET + bi]
+        is_act = bool(b.get("active"))
+        cnt = int(b.get("count") or 0)
+        tier = int(b.get("tier") or 0)
+        layers = int(b.get("layers") or 0)
+        bond_counts[bi] = cnt
+        if is_act:
+            f[4] = 1.0
+            if layers > 0:
+                total_activated_layers += layers
+            if core_bond_mask[bi]:
+                active_core_cnt += 1
+                active_core_bonds.add(bi)
+                if tier > max_core_tier:
+                    max_core_tier = tier
+            else:
+                active_addon_cnt += 1
+        f[5] = float(cnt) / 8.0
+        f[6] = float(tier) * 0.25
+        if layers > 0:
+            f[7] = log1p(layers) / 7.0
+            f[10] = (700.0 if layers > 700 else float(layers)) / 350.0
+        ths = b.get("thresholds")
+        next_delta = 0
+        if ths:
+            for th in ths:
+                if th > cnt:
+                    next_delta = int(th - cnt)
+                    f[8] = float(next_delta) / 6.0
+                    break
+            if next_delta == 1:
+                f[9] = 1.0
+            elif next_delta == 0 and cnt >= ths[-1]:
+                f[11] = 1.0
+        bond_next_delta[bi] = next_delta
 
     # ---- [2] MATCH_STAGE token ---------------------------------------------
     phase_idx = PHASE_TO_IDX.get(phase, 0)
     inv_last_rnd = 1.0 / float(last_rnd)
-    diff_idx = DIFF_TO_IDX.get(pub.get("difficulty") or "FUNNY", 2)
+    diff_idx = DIFF_TO_IDX.get(difficulty, 2)
     bond_choice = pub.get("bondChoice")
+    lp_val = int(own.get("lp") or 0)
+    own_stats = own.get("stats") or {}
+    leaks_val = int(own_stats.get("leaks") or 0)
     ms = cont_np[MATCH_STAGE_IDX]
     if 0 <= phase_idx < 5:
         ms[phase_idx] = 1.0
@@ -922,7 +1014,7 @@ def _fill_features_numpy(
     if pub.get("spRound"):
         ms[9] = 1.0
     ms[10] = float(diff_idx) / max(1, len(DIFF_TO_IDX) - 1)
-    ms[11] = float(own.get("lp") or 0) / 30.0
+    ms[11] = float(lp_val) / 30.0
     if own.get("alive", True):
         ms[12] = 1.0
     if bond_choice and bond_choice.get("picked") is None:
@@ -930,8 +1022,15 @@ def _fill_features_numpy(
     fac_to_idx = cat.faction_to_idx
     for fac in pub.get("factions") or ():
         fi = fac_to_idx.get(fac)
-        if fi is not None and 14 + fi < CONT_DIM:
+        if fi is not None and 14 + fi < 23:
             ms[14 + fi] = 1.0
+    ms[23] = (700.0 if total_activated_layers > 700 else float(total_activated_layers)) / 350.0
+    if total_activated_layers > 350 and lp_val > 1:
+        ms[24] = 1.0
+    ms[25] = atk_scale / 3.0
+    ms[26] = hp_scale / 4.0
+    if leaks_val > 0:
+        ms[27] = log1p(leaks_val) / 4.0
 
     # ---- [3] BOSS token ----------------------------------------------------
     hidden_boss_id = pub.get("hiddenBossId")
@@ -947,8 +1046,27 @@ def _fill_features_numpy(
     if hidden_boss_id:
         bf[3] = 1.0
     bf[4] = max(0, boss_round - rnd) * inv_last_rnd
+    boss_pool_hp = cat.boss_pool_hp(active_boss_id, mode_id, difficulty)
+    if boss_pool_hp > 0.0:
+        bf[5] = log1p(boss_pool_hp) / 16.0
+        bf[16] = (2_500_000.0 if boss_pool_hp > 2_500_000.0 else boss_pool_hp) / 1_000_000.0
+    bm = cat.boss_meta.get(active_boss_id) if active_boss_id else None
+    if bm is not None:
+        bf[10] = float(bm.lpr) / 30.0
+        bem = enemy_meta.get(bm.enemy_key)
+        if bem is not None:
+            if bem.atk > 0.0:
+                bf[6] = log1p(bem.atk) / 10.0
+            if bem.def_ > 0.0:
+                bf[7] = log1p(bem.def_) / 8.0
+            bf[8] = bem.res / 100.0
+            bf[9] = bem.move_speed / 2.0
+            if bem.is_arts:
+                bf[11] = 1.0
+            if bem.is_ranged:
+                bf[12] = 1.0
 
-    # ---- [4] ECONOMY_SHOP token --------------------------------------------
+    # ---- [4] ECONOMY_SHOP token (board aggregates filled after board pass) -
     shop = own.get("shop") or {}
     funds = int(own.get("funds") or 0)
     shop_lv = int(shop.get("level") or 1)
@@ -1033,14 +1151,39 @@ def _fill_features_numpy(
         bc[12] = 1.0
     elif tgt_type == "MAP_TILE":
         bc[13] = 1.0
+    bc[17] = float(active_core_cnt) / 4.0
+    bc[18] = float(max_core_tier) / 3.0
+    bc[19] = float(active_addon_cnt) / 8.0
 
-    # ---- [6..11] EFFECTS tokens --------------------------------------------
-    effects = own.get("effects")
-    if effects:
+    # ---- [6..11] EFFECTS tokens (prioritize band/command & counted buffs) --
+    raw_effects = own.get("effects")
+    if raw_effects:
+        valid_effects = [e for e in raw_effects if e]
+        for eff in valid_effects:
+            prog = eff.get("progress")
+            rprog = eff.get("roundProgress")
+            if prog or rprog:
+                bc[16] = 1.0
+                if isinstance(prog, Mapping):
+                    tot = max(1, int(prog.get("total") or 1))
+                    bc[14] = float(prog.get("current") or 0) / float(tot)
+                if isinstance(rprog, Mapping):
+                    rtot = max(1, int(rprog.get("total") or 1))
+                    bc[15] = float(rprog.get("current") or 0) / float(rtot)
+                break
+        if len(valid_effects) > MAX_EFFECT_SLOTS:
+            valid_effects.sort(
+                key=lambda e: (
+                    0
+                    if (e.get("iconKind") == "band" or e.get("command"))
+                    else (1 if (e.get("counter") is not None or e.get("progress") is not None) else 2)
+                )
+            )
+            eff_overflow = 1.0
+        else:
+            eff_overflow = 0.0
         inv_eff = 1.0 / max(1.0, float(MAX_EFFECT_SLOTS - 1))
-        for i, eff in enumerate(effects[:MAX_EFFECT_SLOTS]):
-            if not eff:
-                continue
+        for i, eff in enumerate(valid_effects[:MAX_EFFECT_SLOTS]):
             tok_idx = EFFECT_OFFSET + i
             valid_np[tok_idx] = True
             cat_np[tok_idx, CAT_ENTITY] = entity_idx_fn(eff.get("id"))
@@ -1056,6 +1199,18 @@ def _fill_features_numpy(
             elif ik == "band":
                 ef[4] = 1.0
             ef[5] = float(i) * inv_eff
+            cnt_eff = eff.get("counter")
+            if cnt_eff is not None:
+                ef[6] = 1.0
+                cval = float(cnt_eff)
+                if cval > 0.0:
+                    ef[7] = (15.0 if cval > 15.0 else cval) / 15.0
+            prog = eff.get("progress")
+            if isinstance(prog, Mapping):
+                tot = max(1, int(prog.get("total") or 1))
+                ef[8] = float(prog.get("current") or 0) / float(tot)
+            if eff_overflow > 0.0:
+                ef[9] = 1.0
 
     # ---- Helper to populate a piece (chess / item / token) -----------------
     def _fill_piece(tok_idx: int, p: Mapping[str, Any], on_board: bool) -> None:
@@ -1078,6 +1233,8 @@ def _fill_features_numpy(
 
         f = cont_np[tok_idx]
         f[0] = 1.0
+        cm = None
+        im = None
         if kind == "chess":
             f[1] = 1.0
             cm = chess_meta.get(pid)
@@ -1124,11 +1281,95 @@ def _fill_features_numpy(
                 rlen = len(st.get("range") or ())
             f[17] = float(rlen) / 20.0
 
+        # Non-board pieces (HAND/TEMP) have free cols [19..27]; BOARD uses [18..27] for spatial terrain!
+        if not on_board:
+            prog = p.get("progress")
+            if isinstance(prog, Mapping):
+                tot = max(1, int(prog.get("total") or 1))
+                f[19] = float(prog.get("current") or 0) / float(tot)
+            elif items:
+                best_pr = 0.0
+                for it in items:
+                    ipr = it.get("progress")
+                    if isinstance(ipr, Mapping):
+                        pr = float(ipr.get("current") or 0) / float(max(1, int(ipr.get("total") or 1)))
+                        if pr > best_pr:
+                            best_pr = pr
+                if best_pr > 0.0:
+                    f[19] = best_pr
+            stag = p.get("showTag")
+            if isinstance(stag, Sequence) and not isinstance(stag, (str, bytes)) and len(stag) > 0:
+                sv = float(stag[0] or 0)
+                if sv > 0.0:
+                    f[20] = log1p(sv) / 4.0
+            gtags = p.get("garrisonTags")
+            if isinstance(gtags, Mapping) and gtags:
+                gsum = 0.0
+                for vals in gtags.values():
+                    if isinstance(vals, Sequence) and not isinstance(vals, (str, bytes)) and len(vals) > 0:
+                        v0 = float(vals[0] or 0)
+                        if v0 > 0.0:
+                            gsum += v0
+                if gsum > 0.0:
+                    f[21] = log1p(gsum) / 5.0
+            if im is not None:
+                if im.give_bond_idx >= 0 or im.can_give_bond:
+                    f[22] = 1.0
+                if im.give_bond_idx >= 0 and bond_next_delta.get(im.give_bond_idx, 0) == 1:
+                    f[23] = 1.0
+            elif cm is not None and cm.base_idx not in board_base_indices:
+                for bi in cm.bond_indices:
+                    if bond_next_delta.get(bi, 0) == 1:
+                        f[23] = 1.0
+                        break
+
     # ---- [12..47] BOARD pieces (terrain already copied from stage template) -
+    board_melee = 0
+    board_ranged = 0
+    total_block = 0
+    path_block = 0
+    board_chess_cnt = 0
+    equipped_items_cnt = 0
+    golden_board_cnt = 0
     for p in board_list:
         if p:
-            tok_idx = BOARD_OFFSET + (int(p["row"]) - FIELD_R0) * BOARD_COLS + (int(p["col"]) - FIELD_C0)
+            tile_idx = (int(p["row"]) - FIELD_R0) * BOARD_COLS + (int(p["col"]) - FIELD_C0)
+            tok_idx = BOARD_OFFSET + tile_idx
             _fill_piece(tok_idx, p, on_board=True)
+            kind = p.get("kind")
+            pid = p.get("id")
+            st = stats_by_uid.get(int(p["uid"]))
+            if kind == "chess":
+                board_chess_cnt += 1
+                equipped_items_cnt += len(p.get("items") or ())
+                if p.get("golden"):
+                    golden_board_cnt += 1
+                cm = chess_meta.get(pid)
+                pos_cls = cm.pos_class if cm else 0
+                blk = int(st.get("blockCnt") or 0) if st else (cm.block_cnt if cm else 0)
+            elif kind == "token":
+                pos_cls = token_pos_class.get(pid, 0)
+                blk = int(st.get("blockCnt") or 0) if st else 0
+            else:
+                pos_cls = 0
+                blk = 0
+            if pos_cls == 1:
+                board_melee += 1
+            elif pos_cls == 2:
+                board_ranged += 1
+            if blk > 0:
+                total_block += blk
+                if 0 <= tile_idx < BOARD_TILES and spatial_grid[tile_idx].is_ground_path:
+                    path_block += blk
+
+    ec[21] = float(board_melee) / 8.0
+    ec[22] = float(board_ranged) / 8.0
+    ec[23] = (20.0 if total_block > 20 else float(total_block)) / 20.0
+    ec[24] = (16.0 if path_block > 16 else float(path_block)) / 16.0
+    ec[25] = float(equipped_items_cnt) / float(max(1, 2 * board_chess_cnt))
+    if unequipped_item_cnt > 0:
+        ec[26] = 1.0
+    ec[27] = float(golden_board_cnt) / float(dep_cap)
 
     # ---- [48..57] HAND_SLOTS (10) & [58..62] TEMP_SLOTS (5) ----------------
     for i, p in enumerate(hand_list[:10]):
@@ -1140,6 +1381,54 @@ def _fill_features_numpy(
             _fill_piece(TEMP_OFFSET + i, p, on_board=False)
 
     # ---- [63..68] SHOP_SLOTS (6) & [69..71] REWARD_SLOTS (3) ---------------
+    def _fill_offer_synergy(f: np.ndarray, kind: str | None, sid: str | None) -> None:
+        if kind == "chess":
+            f[1] = 1.0
+            cm = chess_meta.get(sid)
+            if cm:
+                f[7] = float(cm.tier) / 6.0
+                f[8] = float(cm.pos_class) * 0.5
+                owned = owned_base_counts.get(cm.base_idx, 0)
+                f[9] = float(owned) / 3.0
+                if not cm.is_golden and owned + 1 >= cm.upgrade_num:
+                    f[10] = 1.0
+                new_base = cm.base_idx not in board_base_indices
+                owned_matches = 0
+                for bi in cm.bond_indices:
+                    if new_base and bond_next_delta.get(bi, 0) == 1:
+                        f[11] = 1.0
+                    if bi in active_core_bonds:
+                        f[12] = 1.0
+                    if bond_counts.get(bi, 0) > 0:
+                        owned_matches += 1
+                if owned_matches > 0:
+                    f[13] = (3.0 if owned_matches > 3 else float(owned_matches)) / 3.0
+                if cm.block_cnt > 0:
+                    f[15] = float(cm.block_cnt) / 4.0
+                if cm.is_arts:
+                    f[16] = 1.0
+        elif kind == "item":
+            f[2] = 1.0
+            im = item_meta.get(sid)
+            if im:
+                f[7] = float(im.tier) / 6.0
+                owned_it = owned_item_counts.get(im.entity_idx, 0)
+                f[9] = float(owned_it) * 0.5
+                if im.mergeable and not im.is_golden:
+                    need = im.upgrade_num if im.upgrade_num > 1 else 2
+                    if need < 100 and owned_item_merge_counts.get(im.entity_idx, 0) + 1 >= need:
+                        f[10] = 1.0
+                gb = im.give_bond_idx
+                if gb >= 0:
+                    if bond_next_delta.get(gb, 0) == 1:
+                        f[11] = 1.0
+                    if gb in active_core_bonds:
+                        f[12] = 1.0
+                    if bond_counts.get(gb, 0) > 0:
+                        f[13] = 1.0 / 3.0
+                if gb >= 0 or im.can_give_bond:
+                    f[14] = 1.0
+
     shop_slots = shop.get("slots")
     if shop_slots:
         for i, s in enumerate(shop_slots[:6]):
@@ -1161,19 +1450,7 @@ def _fill_features_numpy(
             f[5] = float(price) / 6.0
             if not sold and price <= funds:
                 f[6] = 1.0
-            if kind == "chess":
-                f[1] = 1.0
-                cm = chess_meta.get(sid)
-                if cm:
-                    f[7] = float(cm.tier) / 6.0
-                    f[8] = float(cm.pos_class) * 0.5
-                    f[9] = float(owned_base_counts.get(cm.base_idx, 0)) / 3.0
-            elif kind == "item":
-                f[2] = 1.0
-                im = item_meta.get(sid)
-                if im:
-                    f[7] = float(im.tier) / 6.0
-                    f[9] = float(owned_item_counts.get(im.entity_idx, 0)) * 0.5
+            _fill_offer_synergy(f, kind, sid)
 
     if reward_offer:
         reward_slots = reward_offer.get("slots")
@@ -1190,21 +1467,14 @@ def _fill_features_numpy(
                 f[0] = 1.0
                 if s.get("sold"):
                     f[3] = 1.0
-                if kind == "chess":
-                    f[1] = 1.0
-                    cm = chess_meta.get(sid)
-                    if cm:
-                        f[7] = float(cm.tier) / 6.0
-                        f[8] = float(cm.pos_class) * 0.5
-                        f[9] = float(owned_base_counts.get(cm.base_idx, 0)) / 3.0
-                elif kind == "item":
-                    f[2] = 1.0
+                _fill_offer_synergy(f, kind, sid)
 
     # ---- [72..79] CHOICE_CARDS (8) -----------------------------------------
     bond_group_members0: Sequence[str] = ()
     bond_group_members1: Sequence[str] = ()
     if phase == "INFO_CHECK" and bond_choice and bond_choice.get("picked") is None:
         groups = bond_choice.get("groups") or ()
+        core_pos = {bi: pos for pos, bi in enumerate(cat.core_bond_indices[:10])}
         for i, grp in enumerate(groups[:MAX_CHOICE_SLOTS]):
             tok_idx = CHOICE_OFFSET + i
             valid_np[tok_idx] = True
@@ -1214,6 +1484,12 @@ def _fill_features_numpy(
             f[1] = 1.0
             f[5] = float(len(grp)) / 6.0
             f[18] = float(i)
+            for bid in grp:
+                bi = bond_to_idx.get(bid)
+                if bi is not None:
+                    cpos = core_pos.get(bi)
+                    if cpos is not None:
+                        f[6 + cpos] = 1.0
             if i == 0:
                 bond_group_members0 = grp
             elif i == 1:
@@ -1260,12 +1536,7 @@ def _fill_features_numpy(
             f[5] = float(c.get("cost") or 0) / 10.0
             f[18] = float(i) / 7.0
 
-    # ---- [80..105] BONDS (26) (static SEG/BOND/core already copied) --------
-    bond_to_idx = cat.bond_to_idx
-    for bid in pub.get("disabledBonds") or ():
-        bi = bond_to_idx.get(bid)
-        if bi is not None:
-            cont_np[BOND_OFFSET + bi, 1] = 1.0
+    # Link INFO_CHECK bond groups onto BONDS tokens [80..105] cols 2..3
     for bid in bond_group_members0:
         bi = bond_to_idx.get(bid)
         if bi is not None:
@@ -1274,30 +1545,12 @@ def _fill_features_numpy(
         bi = bond_to_idx.get(bid)
         if bi is not None:
             cont_np[BOND_OFFSET + bi, 3] = 1.0
-    for b in own.get("bonds") or ():
-        bi = bond_to_idx.get(b["bondId"])
-        if bi is None:
-            continue
-        f = cont_np[BOND_OFFSET + bi]
-        if b.get("active"):
-            f[4] = 1.0
-        cnt = int(b.get("count") or 0)
-        f[5] = float(cnt) / 8.0
-        f[6] = float(b.get("tier") or 0) * 0.25
-        layers = b.get("layers")
-        if layers and layers > 0:
-            f[7] = log1p(layers) / 7.0
-        ths = b.get("thresholds")
-        if ths:
-            for th in ths:
-                if th > cnt:
-                    f[8] = float(th - cnt) / 6.0
-                    break
 
     # ---- [106..113] ENEMIES (up to 8) --------------------------------------
     enemies = own.get("nextEnemies")
     if enemies:
         agg: dict[tuple[str, str], list[Any]] = {}
+        boss_r0 = FIELD_R0 - BOSS_ROW_OFFSET
         for e in enemies:
             ek = e.get("enemyKey") or ""
             gt = e.get("gate") or "lower"
@@ -1305,16 +1558,38 @@ def _fill_features_numpy(
             rec = agg.get(k_eg)
             cnt_e = int(e.get("count") or 1)
             t_e = float(e.get("t") or 0.0)
+            is_bounty = e.get("source") == "bounty"
+            st_pos = e.get("start")
+            valid_start = (
+                st_pos
+                if isinstance(st_pos, Sequence) and not isinstance(st_pos, (str, bytes)) and len(st_pos) >= 2
+                else None
+            )
             if rec is None:
-                agg[k_eg] = [ek, gt, cnt_e, t_e, bool(e.get("fly")), bool(e.get("elite")), bool(e.get("boss"))]
+                agg[k_eg] = [
+                    ek,
+                    gt,
+                    cnt_e,
+                    t_e,
+                    bool(e.get("fly")),
+                    bool(e.get("elite")),
+                    bool(e.get("boss")),
+                    is_bounty,
+                    valid_start,
+                ]
             else:
                 rec[2] += cnt_e
                 if t_e < rec[3]:
                     rec[3] = t_e
+                if is_bounty:
+                    rec[7] = True
+                if rec[8] is None and valid_start is not None:
+                    rec[8] = valid_start
         ranked = sorted(
             agg.values(),
             key=lambda x: (not x[6], not x[5], -x[2], x[3]),
         )[:MAX_ENEMY_SLOTS]
+        boss_start_set = False
         for i, rec in enumerate(ranked):
             tok_idx = ENEMY_OFFSET + i
             valid_np[tok_idx] = True
@@ -1330,8 +1605,52 @@ def _fill_features_numpy(
                 f[4] = 1.0
             if rec[5]:
                 f[5] = 1.0
-            if rec[6]:
+            is_e_boss = bool(rec[6])
+            if is_e_boss:
                 f[6] = 1.0
+            em = enemy_meta.get(rec[0])
+            if em is not None:
+                if is_e_boss:
+                    hp_eff = boss_pool_hp if boss_pool_hp > 0.0 else em.max_hp
+                    atk_eff = em.atk
+                    spd_eff = em.move_speed
+                else:
+                    hp_eff = em.max_hp * hp_scale
+                    atk_eff = em.atk * atk_scale
+                    spd_eff = em.move_speed * spd_scale
+                if hp_eff > 0.0:
+                    f[7] = log1p(hp_eff) / 14.0
+                if atk_eff > 0.0:
+                    f[8] = log1p(atk_eff) / 10.0
+                if em.def_ > 0.0:
+                    f[9] = log1p(em.def_) / 8.0
+                f[10] = em.res / 100.0
+                if spd_eff > 0.0:
+                    f[11] = (3.0 if spd_eff > 3.0 else spd_eff) / 2.5
+                f[12] = (10.0 if em.lpr > 10 else float(em.lpr)) / 5.0
+                if em.is_arts:
+                    f[13] = 1.0
+                if em.is_ranged:
+                    f[14] = 1.0
+            if rec[7]:
+                f[15] = 1.0
+            st_pos = rec[8]
+            if st_pos is not None:
+                sr_norm = float(float(st_pos[0]) - boss_r0) / 3.0
+                sc_norm = float(float(st_pos[1]) - FIELD_C0) / 8.0
+                f[16] = sr_norm
+                f[17] = sc_norm
+                if is_e_boss and not boss_start_set:
+                    bf[13] = 1.0
+                    bf[14] = sr_norm
+                    bf[15] = sc_norm
+                    if rec[1] == "upper":
+                        bf[17] = 1.0
+                    boss_start_set = True
+            elif is_e_boss and not boss_start_set:
+                if rec[1] == "upper":
+                    bf[17] = 1.0
+                boss_start_set = True
 
     return uid_to_token, uid_to_items
 

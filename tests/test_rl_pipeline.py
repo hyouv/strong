@@ -771,3 +771,176 @@ def test_decoupled_strategic_entropy_and_opening_diversity_masking() -> None:
     u_stats = ppo_update(model, opt, rollout, cfg=ppo_cfg)
     assert "opening_entropy" in u_stats and u_stats["opening_entropy"] >= 0.0
     assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())
+
+
+def test_zero_arch_observation_features_and_shape_invariance() -> None:
+    """Zero-arch feature enrichments must preserve (114, 8, 28) shapes and populate all new tactical/macro cues."""
+    from stronghold_rl.codec import (
+        BOND_OFFSET,
+        CHOICE_OFFSET,
+        ENEMY_OFFSET,
+        HAND_OFFSET,
+        REWARD_OFFSET,
+        SHOP_OFFSET,
+    )
+
+    cat = get_catalog()
+    assert NUM_TOKENS == 114
+    assert NUM_CAT_FIELDS == 8
+    assert CONT_DIM == 28
+
+    # 1. INFO_CHECK bond-group choice cards must directly encode 10-dim core bond multi-hot in cols [6..15]
+    with RoomClient() as rc:
+        f_info = rc.reset(seed=51001, mode_id="mode_single_15", policy_version=0, compact=True, boss_id="boss_17")
+    assert f_info["phase"] == "INFO_CHECK"
+    enc_info = encode_frame(f_info, cat)
+    assert enc_info.cont_feats.shape == (114, 28)
+    assert float(enc_info.cont_feats[CHOICE_OFFSET, 6:16].sum()) >= 1.0
+    assert float(enc_info.cont_feats[CHOICE_OFFSET + 1, 6:16].sum()) >= 1.0
+    # Mode L15 vs L20 Boss HP pool must differ cleanly on BOSS token cols [5, 16]
+    f_l20 = copy.deepcopy(f_info)
+    f_l20["pub"]["modeId"] = "mode_single_20"
+    enc_l20 = encode_frame(f_l20, cat)
+    assert float(enc_info.cont_feats[BOSS_IDX, 5]) > 0.5
+    assert float(enc_l20.cont_feats[BOSS_IDX, 16]) > float(enc_info.cont_feats[BOSS_IDX, 16]) + 0.5
+    assert float(enc_info.cont_feats[BOSS_IDX, 6]) > 0.0  # boss ATK
+    assert float(enc_info.cont_feats[BOSS_IDX, 10]) > 0.0  # boss lpr
+
+    # 2. Synthetic PREP frame exercising all new zero-arch feature slots
+    sample_chess_id = next(cid for cid, m in cat.chess_meta.items() if not m.is_golden and m.block_cnt >= 2 and m.bond_indices)
+    sample_cm = cat.chess_meta[sample_chess_id]
+    b0_id = cat.bond_ids[sample_cm.bond_indices[0]]
+    sample_item_id = next(iid for iid, m in cat.item_meta.items() if m.give_bond_idx >= 0 and m.mergeable)
+    sample_im = cat.item_meta[sample_item_id]
+    b_item_id = cat.bond_ids[sample_im.give_bond_idx]
+    b17_ek = cat.boss_meta["boss_17"].enemy_key
+    stage_id = next(iter(cat.stage_normal_spatial.keys()))
+    path_idx = next(i for i, sp in enumerate(cat.stage_boss_spatial[stage_id]) if sp.is_ground_path)
+    p_row = 9 + path_idx // 9
+    p_col = 2 + path_idx % 9
+
+    prep_frame = {
+        "phase": "PREP",
+        "pub": {
+            "round": 14,
+            "lastRound": 15,
+            "bossRound": 14,
+            "hiddenRound": 15,
+            "spRound": False,
+            "modeId": "mode_single_15",
+            "difficulty": "ABYSS",
+            "stageId": stage_id,
+            "factions": [],
+            "bossId": "boss_17",
+            "hiddenBossId": "boss_15",
+            "disabledBonds": [],
+            "bondChoice": None,
+            "sp": None,
+        },
+        "own": {
+            "lp": 10,
+            "alive": True,
+            "funds": 12,
+            "deployCount": 1,
+            "deployCap": 8,
+            "stashCount": 0,
+            "canReady": True,
+            "bandId": "band_cannot",
+            "shop": {
+                "level": 5,
+                "maxLevel": 6,
+                "upgradePrice": 8,
+                "refreshPrice": 2,
+                "freeRefreshes": 0,
+                "frozen": False,
+                "slots": [
+                    {"id": sample_chess_id, "kind": "chess", "sold": False, "frozen": False, "price": 3},
+                    {"id": sample_item_id, "kind": "item", "sold": False, "frozen": False, "price": 2},
+                ],
+                "rewardOffer": {
+                    "slots": [
+                        {"id": sample_item_id, "kind": "item", "sold": False, "price": 0},
+                    ]
+                },
+            },
+            "command": None,
+            "effects": [
+                {"id": "aceffect_band_99", "command": True, "commandType": "PASSIVE", "iconKind": "band", "progress": {"current": 2, "total": 4}, "roundProgress": {"current": 1, "total": 2}},
+                {"id": "eff_static_1", "command": False, "iconKind": "choice"},
+                {"id": "eff_static_2", "command": False, "iconKind": "choice"},
+                {"id": "eff_static_3", "command": False, "iconKind": "choice"},
+                {"id": "eff_static_4", "command": False, "iconKind": "choice"},
+                {"id": "eff_static_5", "command": False, "iconKind": "choice"},
+                {"id": "eff_bounty_counted", "command": False, "iconKind": "choice", "counter": 3},
+            ],
+            "board": [
+                {"uid": 101, "kind": "chess", "id": sample_chess_id, "golden": False, "tier": sample_cm.tier, "count": 1, "row": p_row, "col": p_col, "dir": "RIGHT", "items": [{"uid": 201, "id": sample_item_id}]},
+            ],
+            "hand": [
+                {"uid": 102, "kind": "chess", "id": sample_chess_id, "golden": False, "tier": sample_cm.tier, "count": 1, "garrisonTags": {"g1": [5]}},
+                {"uid": 202, "kind": "item", "id": sample_item_id, "golden": False, "tier": sample_im.tier, "count": 1, "progress": {"current": 3, "total": 8}, "showTag": [7]},
+            ],
+            "temp": [],
+            "bonds": [
+                {"bondId": b0_id, "active": True, "count": 2, "tier": 1, "layers": 360, "thresholds": [2, 3, 6]},
+                {"bondId": b_item_id, "active": True, "count": 2, "tier": 1, "layers": 10, "thresholds": [2, 3]},
+            ],
+            "personalChoice": None,
+            "commandDraft": None,
+            "nextEnemies": [
+                {"enemyKey": b17_ek, "gate": "upper", "count": 1, "t": 0, "fly": False, "elite": True, "boss": True, "source": "wave", "start": [3, 10]},
+            ],
+            "stats": {"leaks": 4, "kills": 80, "merges": 2},
+        },
+        "detail": {"units": [{"uid": 101, "maxHp": 4000, "atk": 600, "def": 500, "res": 10, "interval": 1.2, "blockCnt": 3, "rangeLen": 2}]},
+        "actions": [{"t": "g.ready"}],
+    }
+    enc_p = encode_frame(prep_frame, cat)
+    cf = enc_p.cont_feats
+    assert torch.isfinite(cf).all()
+    # MATCH_STAGE[23..27]: activated layers > 350 + lp > 1 -> hidden eligible, scales > 0, leaks > 0
+    assert float(cf[MATCH_STAGE_IDX, 23]) > 1.0
+    assert float(cf[MATCH_STAGE_IDX, 24]) == 1.0
+    assert float(cf[MATCH_STAGE_IDX, 25]) > 0.5 and float(cf[MATCH_STAGE_IDX, 26]) > 0.5
+    assert float(cf[MATCH_STAGE_IDX, 27]) > 0.0
+    # BOSS[13..15, 17]: boss spawn coords & upper gate from nextEnemies
+    assert float(cf[BOSS_IDX, 13]) == 1.0
+    assert abs(float(cf[BOSS_IDX, 14]) - (1.0 / 3.0)) < 1e-5
+    assert abs(float(cf[BOSS_IDX, 15]) - 1.0) < 1e-5
+    assert float(cf[BOSS_IDX, 17]) == 1.0
+    # ECONOMY_SHOP[21..26]: melee, block, path_block, equip_ratio, unequipped item present
+    assert float(cf[ECONOMY_SHOP_IDX, 23]) > 0.0
+    assert float(cf[ECONOMY_SHOP_IDX, 24]) > 0.0
+    assert abs(float(cf[ECONOMY_SHOP_IDX, 25]) - 0.5) < 1e-5
+    assert float(cf[ECONOMY_SHOP_IDX, 26]) == 1.0
+    # BAND_COMMAND[14..16]: band progress & roundProgress
+    assert abs(float(cf[BAND_COMMAND_IDX, 14]) - 0.5) < 1e-5
+    assert abs(float(cf[BAND_COMMAND_IDX, 15]) - 0.5) < 1e-5
+    assert float(cf[BAND_COMMAND_IDX, 16]) == 1.0
+    # EFFECTS overflow: counted bounty effect must be prioritized into top 6 slots (index 1!)
+    assert float(cf[EFFECT_OFFSET + 1, 6]) == 1.0
+    assert abs(float(cf[EFFECT_OFFSET + 1, 7]) - 0.2) < 1e-5
+    assert float(cf[EFFECT_OFFSET, 9]) == 1.0
+    # HAND[19..23]: garrisonTags on chess, progress/showTag/gives_bond/advances_bond on item
+    assert float(cf[HAND_OFFSET, 21]) > 0.0
+    assert abs(float(cf[HAND_OFFSET + 1, 19]) - (3.0 / 8.0)) < 1e-5
+    assert float(cf[HAND_OFFSET + 1, 20]) > 0.0
+    assert float(cf[HAND_OFFSET + 1, 22]) == 1.0
+    assert float(cf[HAND_OFFSET + 1, 23]) == 1.0
+    # SHOP/REWARD[10..15]: chess triggers merge (2 owned + 1 >= 3), static block_cnt; item triggers merge & gives bond
+    assert float(cf[SHOP_OFFSET, 10]) == 1.0
+    assert float(cf[SHOP_OFFSET, 15]) > 0.0
+    assert float(cf[SHOP_OFFSET + 1, 10]) == 1.0
+    assert float(cf[SHOP_OFFSET + 1, 11]) == 1.0
+    assert float(cf[SHOP_OFFSET + 1, 14]) == 1.0
+    assert float(cf[REWARD_OFFSET, 7]) > 0.0  # fixed missing reward item tier!
+    assert float(cf[REWARD_OFFSET, 14]) == 1.0
+    # BONDS[9..10]: one_away_from_next_tier & linear layers
+    b0_idx = cat.bond_to_idx[b0_id]
+    assert float(cf[BOND_OFFSET + b0_idx, 9]) == 1.0
+    assert float(cf[BOND_OFFSET + b0_idx, 10]) > 1.0
+    # ENEMIES[7..17]: boss stats + start coords
+    assert float(cf[ENEMY_OFFSET, 7]) > 0.5
+    assert float(cf[ENEMY_OFFSET, 8]) > 0.5
+    assert abs(float(cf[ENEMY_OFFSET, 16]) - (1.0 / 3.0)) < 1e-5
+    assert abs(float(cf[ENEMY_OFFSET, 17]) - 1.0) < 1e-5
