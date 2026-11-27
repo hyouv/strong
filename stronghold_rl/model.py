@@ -20,6 +20,8 @@ from .codec import (
     CAT_SEG,
     CAT_STAGE,
     CONT_DIM,
+    CHOICE_OFFSET,
+    MAX_CHOICE_SLOTS,
     MAX_EQUIP_SLOTS,
     NO_ARG,
     NUM_ACTION_TYPES,
@@ -28,7 +30,9 @@ from .codec import (
     NUM_TOKENS,
     POLICY_CLS_IDX,
     TYPE_BAND,
+    TYPE_BOND_GROUP,
     TYPE_EQUIP,
+    TYPE_INFO_READY,
     VALUE_CLS_IDX,
     ActionMaskSpec,
     ActionTree,
@@ -693,6 +697,23 @@ class StrongholdPolicyNet(nn.Module):
         joint_lp = lp_type + lp_src + lp_band + lp_tgt + lp_opt
         joint_ent = type_ent + src_ent + band_ent + tgt_ent + opt_ent
 
+        # Monitoring only: semantic bond-group entropy, including the implicit
+        # group-0 selection through INFO_READY. No extra loss or architecture.
+        bond_choice_ent = torch.zeros_like(type_ent)
+        if "bond_choice_mask" in batch:
+            with torch.no_grad():
+                choice_mask = batch["bond_choice_mask"]
+                rows = choice_mask.any(dim=-1)
+                if rows.any():
+                    bond_types = torch.full_like(a_type[rows], TYPE_BOND_GROUP)
+                    bond_ctx = self.src_ctx_proj(torch.cat([g_pol[rows], self.type_emb(bond_types)], dim=-1))
+                    keys = src_keys[rows, CHOICE_OFFSET : CHOICE_OFFSET + MAX_CHOICE_SLOTS]
+                    logits = torch.einsum("bd,bnd->bn", bond_ctx, keys) * self._scale
+                    lp, _ = _masked_log_softmax_and_entropy(logits, choice_mask[rows])
+                    probs = lp.exp() * type_lp_all[rows, TYPE_BOND_GROUP].exp().unsqueeze(-1)
+                    probs[:, 0] += type_lp_all[rows, TYPE_INFO_READY].exp()
+                    bond_choice_ent[rows] = -(probs * probs.clamp_min(1e-30).log()).sum(dim=-1)
+
         if label_smoothing > 0.0:
             ls_type = _masked_smoothed_nll(type_lp_all, a_type, type_mask, label_smoothing)
             ls_src = _masked_smoothed_nll(src_lp_all, safe_src, src_mask, label_smoothing, active=has_src)
@@ -716,6 +737,7 @@ class StrongholdPolicyNet(nn.Module):
             "type_ent": type_ent,
             "src_ent": src_ent,
             "band_ent": band_ent,
+            "bond_choice_ent": bond_choice_ent,
             "tgt_ent": tgt_ent,
             "opt_ent": opt_ent,
             "value": values,

@@ -10,7 +10,7 @@ Features:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -32,9 +32,12 @@ from .bc import (
     save_checkpoint,
 )
 from .catalog import GameCatalog, get_catalog
-from .codec import TYPE_BAND, TYPE_BOND_GROUP, encode_frame
+from .codec import MAX_CHOICE_SLOTS, TYPE_BAND, TYPE_BOND_GROUP, encode_frame
 from .model import PolicyConfig, StepMasks, StrongholdPolicyNet
-from .rollout import STRATEGIC_ACTION_TYPES, AsyncActorPool, mask_opening_diversity, prep_state_signature
+from .rollout import (
+    STRATEGIC_ACTION_TYPES, AsyncActorPool, mask_opening_diversity,
+    mask_random_opening, opening_bond_mask, prep_state_signature,
+)
 
 
 @dataclass
@@ -77,6 +80,14 @@ class PPOConfig:
     ban_band_prob: float = 0.0
     ban_bond_groups: tuple[str, ...] = ()
     ban_bond_group_prob: float = 0.0
+    opening_mask_prob: float = 0.0
+    opening_band_keep_ratio: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.opening_mask_prob <= 1.0:
+            raise ValueError("opening_mask_prob must be in [0, 1]")
+        if not 0.0 < self.opening_band_keep_ratio <= 1.0:
+            raise ValueError("opening_band_keep_ratio must be in (0, 1]")
 
 
 @dataclass
@@ -95,6 +106,7 @@ class _Transition:
     done: bool = False
     round_end: bool = False
     is_strategic: bool = False
+    bond_choice_mask: tuple[bool, ...] = (False,) * MAX_CHOICE_SLOTS
 
 
 def _schedule_linear(start: float, end: float, progress: float) -> float:
@@ -105,6 +117,23 @@ def _schedule_linear(start: float, end: float, progress: float) -> float:
 def _schedule_cosine(start: float, end: float, progress: float) -> float:
     p = max(0.0, min(1.0, float(progress)))
     return float(end) + 0.5 * (float(start) - float(end)) * (1.0 + math.cos(math.pi * p))
+
+
+def opening_mask_schedule(
+    update: int, *, warmup_updates: int, anneal_updates: int,
+    prob_start: float, prob_end: float, keep_start: float, keep_end: float,
+) -> tuple[float, float]:
+    """Hold the start during critic warmup; ramp over the first N actor updates."""
+    if update <= warmup_updates:
+        progress = 0.0
+    elif anneal_updates <= 1:
+        progress = 1.0
+    else:
+        progress = (update - warmup_updates - 1) / (anneal_updates - 1)
+    return (
+        _schedule_linear(prob_start, prob_end, progress),
+        _schedule_linear(keep_start, keep_end, progress),
+    )
 
 
 def build_curriculum_episode_modes(
@@ -309,6 +338,9 @@ def _finalize_ppo_batch(
         "has_tgt": torch.tensor([t["has_tgt"] for t in flat], dtype=torch.bool),
         "opt_mask": torch.stack([t["opt_mask"] for t in flat]),
         "has_opt": torch.tensor([t["has_opt"] for t in flat], dtype=torch.bool),
+        "bond_choice_mask": torch.tensor(
+            [t.get("bond_choice_mask", (False,) * MAX_CHOICE_SLOTS) for t in flat], dtype=torch.bool,
+        ),
         "is_strategic": torch.tensor([bool(t.get("is_strategic", False)) for t in flat], dtype=torch.bool),
         "old_log_prob": old_log_prob,
         "advantages": advantages,
@@ -388,6 +420,8 @@ def collect_ppo_rollouts(
                 ban_band_prob=cfg.ban_band_prob,
                 ban_bond_ids=cfg.ban_bond_groups,
                 ban_bond_prob=cfg.ban_bond_group_prob,
+                opening_mask_prob=cfg.opening_mask_prob,
+                opening_band_keep_ratio=cfg.opening_band_keep_ratio,
                 max_prep_steps_per_round=cfg.max_prep_steps_per_round,
                 sampling_temperature=sampling_temperature,
                 min_batch=min_batch if min_batch > 0 else None,
@@ -429,6 +463,7 @@ def collect_ppo_rollouts(
         ep_timeout_penalized: dict[int, bool] = {}
         ep_ban_bands: dict[int, frozenset[int]] = {}
         ep_ban_bonds: dict[int, frozenset[str]] = {}
+        ep_opening_seeds: dict[int, int] = {}
 
         def _sample_ep_bans(ep_idx: int) -> tuple[frozenset[int], frozenset[str]]:
             if not ((ban_band_idxs and cfg.ban_band_prob > 0.0) or (cfg.ban_bond_groups and cfg.ban_bond_group_prob > 0.0)):
@@ -466,6 +501,7 @@ def collect_ppo_rollouts(
             ep_seen_sigs[w] = {}
             ep_timeout_penalized[w] = False
             ep_ban_bands[w], ep_ban_bonds[w] = _sample_ep_bans(next_ep)
+            ep_opening_seeds[w] = seed_start + next_ep
             next_ep += 1
         active_frames = sync_pool.exchange(init_cmds)
 
@@ -518,13 +554,18 @@ def collect_ppo_rollouts(
                             repeat_states += 1
                             if cfg.repeat_state_penalty != 0.0:
                                 ep_buf[w][-1].reward += cfg.repeat_state_penalty
-                    if ep_ban_bands[w] or ep_ban_bonds[w]:
+                    if ep_ban_bands[w] or ep_ban_bonds[w] or cfg.opening_mask_prob > 0.0:
                         spec = enc.action_tree.to_mask_spec()
                         masked = mask_opening_diversity(
                             frame,
                             spec,
                             ban_band_idxs=ep_ban_bands[w],
                             ban_bond_ids=ep_ban_bonds[w],
+                        )
+                        masked = mask_random_opening(
+                            frame, masked, episode_seed=ep_opening_seeds[w],
+                            probability=cfg.opening_mask_prob,
+                            band_keep_ratio=cfg.opening_band_keep_ratio,
                         )
                         if masked is not spec:
                             new_tm = torch.tensor(list(masked.type_mask_bytes), dtype=torch.bool)
@@ -561,6 +602,7 @@ def collect_ppo_rollouts(
                             a_tgt=a_tgt,
                             a_opt=a_opt,
                             masks=act["masks"],
+                            bond_choice_mask=opening_bond_mask(enc.action_tree.to_mask_spec()),
                             old_log_prob=act["log_prob"],
                             value=act["value"],
                             reward=cfg.step_penalty if is_prep else 0.0,
@@ -607,6 +649,7 @@ def collect_ppo_rollouts(
                     if next_ep < num_episodes:
                         reset_cmds[w] = _spawn_cmd(next_ep)
                         ep_ban_bands[w], ep_ban_bonds[w] = _sample_ep_bans(next_ep)
+                        ep_opening_seeds[w] = seed_start + next_ep
                         next_ep += 1
                 else:
                     next_active[w] = rep
@@ -634,6 +677,7 @@ def collect_ppo_rollouts(
                 "has_tgt": t.masks.has_tgt,
                 "opt_mask": t.masks.opt_mask,
                 "has_opt": t.masks.has_opt,
+                "bond_choice_mask": t.bond_choice_mask,
                 "old_log_prob": t.old_log_prob,
                 "value": t.value,
                 "reward": t.reward,
@@ -658,6 +702,38 @@ def collect_ppo_rollouts(
         "elapsed_sec": round(time.perf_counter() - t0, 2),
     }
     return batch, stats
+
+
+class _OpeningEntropyStats:
+    """Sample-weighted opening diagnostics, independent of minibatch composition."""
+
+    def __init__(self) -> None:
+        # entropy sum, normalized sum, samples, non-forced samples
+        self.sums = {name: [0.0, 0.0, 0, 0] for name in ("bond", "band")}
+
+    @torch.no_grad()
+    def add(self, out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> None:
+        band_counts = batch["band_mask"].sum(dim=-1) * (batch["a_type"] == TYPE_BAND)
+        entries = [("band", out["band_ent"], band_counts)]
+        if "bond_choice_mask" in batch:
+            entries.append(("bond", out["bond_choice_ent"], batch["bond_choice_mask"].sum(dim=-1)))
+        for name, entropy, counts in entries:
+            active = counts > 0
+            non_forced = counts > 1
+            acc = self.sums[name]
+            acc[0] += float(entropy[active].sum().item())
+            acc[1] += float((entropy[non_forced] / counts[non_forced].float().log()).sum().item())
+            acc[2] += int(active.sum().item())
+            acc[3] += int(non_forced.sum().item())
+
+    def result(self) -> dict[str, float]:
+        result = {}
+        for name, (ent_sum, norm_sum, count, non_forced) in self.sums.items():
+            result[f"{name}_entropy"] = ent_sum / max(1, count)
+            result[f"{name}_entropy_normalized"] = norm_sum / max(1, non_forced)
+            result[f"{name}_forced_frac"] = (count - non_forced) / max(1, count)
+            result[f"{name}_entropy_samples"] = float(count)
+        return result
 
 
 def ppo_update(
@@ -691,6 +767,7 @@ def ppo_update(
     n_strat_batches = 0
     sum_open_ent = 0.0
     n_open_batches = 0
+    opening_stats = _OpeningEntropyStats()
     sum_kl_bc = 0.0
     sum_approx_kl = 0.0
     sum_clip = 0.0
@@ -710,6 +787,7 @@ def ppo_update(
                 mb = {k: v[idx].to(device, non_blocking=True) for k, v in rollout.items()}
 
                 out = model.evaluate_batch(mb)
+                opening_stats.add(out, mb)
                 new_lp = out["log_prob"]
                 old_lp = mb["old_log_prob"]
                 adv = mb["advantages"]
@@ -809,6 +887,7 @@ def ppo_update(
         "explore_entropy": sum_explore_ent / denom,
         "strategic_entropy": sum_strat_ent / max(1, n_strat_batches),
         "opening_entropy": sum_open_ent / max(1, n_open_batches),
+        **opening_stats.result(),
         "kl_to_bc": sum_kl_bc / denom,
         "approx_kl": sum_approx_kl / denom,
         "clip_frac": sum_clip / denom,
@@ -847,6 +926,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--ban-band-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bands during training rollouts")
     parser.add_argument("--ban-bond-groups", type=str, default="", help="Comma-separated core bondIds whose INFO_CHECK group is masked probabilistically (e.g. 'lethaniaShip')")
     parser.add_argument("--ban-bond-group-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bond-groups during training rollouts")
+    parser.add_argument("--opening-mask-prob-start", type=float, default=0.0, help="Initial fraction of episodes with random opening restrictions (training only)")
+    parser.add_argument("--opening-mask-prob-end", type=float, default=0.0, help="Final fraction of episodes with random opening restrictions")
+    parser.add_argument("--opening-band-keep-start", type=float, default=1.0, help="Initial fraction of legal strategies retained in restricted episodes")
+    parser.add_argument("--opening-band-keep-end", type=float, default=1.0, help="Final fraction of legal strategies retained (at least two when possible)")
+    parser.add_argument("--opening-mask-anneal-updates", type=int, default=0, help="Actor updates to ramp opening restrictions after critic warmup (0=all)")
     parser.add_argument("--src-ent-weight", type=float, default=0.5, help="Non-strategic step-2 source-pointer entropy weight")
     parser.add_argument("--tgt-ent-weight", type=float, default=0.15, help="Non-strategic step-3 target-tile pointer entropy weight")
     parser.add_argument("--opt-ent-weight", type=float, default=0.15, help="Non-strategic step-4 facing/replace-slot entropy weight")
@@ -882,6 +966,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", type=str, default="checkpoints/ppo_solo_t1_last.pt")
     parser.add_argument("--best-out", type=str, default="", help="Optional path to save highest-win-rate eval checkpoint")
     args = parser.parse_args(argv)
+
+    for name in ("opening_mask_prob_start", "opening_mask_prob_end"):
+        if not 0.0 <= getattr(args, name) <= 1.0:
+            parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
+    for name in ("opening_band_keep_start", "opening_band_keep_end"):
+        if not 0.0 < getattr(args, name) <= 1.0:
+            parser.error(f"--{name.replace('_', '-')} must be in (0, 1]")
+    if args.opening_mask_anneal_updates < 0:
+        parser.error("--opening-mask-anneal-updates must be >= 0")
+    best_out = args.best_out or str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
+    if Path(args.out).resolve() == Path(best_out).resolve():
+        parser.error("--out and --best-out must be different files")
+    for source in (args.init_ckpt, args.ref_ckpt):
+        if source and Path(source).resolve() in {Path(args.out).resolve(), Path(best_out).resolve()}:
+            parser.error("Checkpoint outputs must not overwrite --init-ckpt or --ref-ckpt")
 
     modes = parse_solo_modes(args.modes)
     eval_modes = parse_solo_modes(args.eval_modes) if args.eval_modes else modes
@@ -929,6 +1028,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif gamma_intra is not None:
         gae_lambda_intra = 1.0
 
+    print(
+        f"Opening masks (train only): prob={args.opening_mask_prob_start:.2f}->{args.opening_mask_prob_end:.2f}, "
+        f"band_keep={args.opening_band_keep_start:.2f}->{args.opening_band_keep_end:.2f}, "
+        f"ramp={args.opening_mask_anneal_updates or 'all'} actor updates; eval=unrestricted | "
+        f"gamma_intra={gamma_intra} gamma_round={args.gamma_round} "
+        f"lambda_intra={gae_lambda_intra} lambda_round={args.gae_lambda}", flush=True,
+    )
+
     warmup = args.critic_warmup if args.init_ckpt else 0
     ppo_cfg = PPOConfig(
         gamma=args.gamma,
@@ -962,13 +1069,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         ban_band_prob=args.ban_band_prob,
         ban_bond_groups=ban_bond_groups,
         ban_bond_group_prob=args.ban_bond_group_prob,
+        opening_mask_prob=args.opening_mask_prob_start,
+        opening_band_keep_ratio=args.opening_band_keep_start,
     )
     critic_opt = torch.optim.AdamW(model.value_head.parameters(), lr=ppo_cfg.critic_lr, weight_decay=1e-4)
     full_opt = torch.optim.AdamW(model.parameters(), lr=ppo_cfg.lr, weight_decay=1e-4)
 
     eval_seeds = [args.eval_seed_start + i for i in range(args.eval_episodes)]
     best_score = (-1.0, -1.0, -1.0)  # (win_rate, hidden_clear_rate, avg_rounds_passed)
-    best_out = args.best_out or str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
+
+    def _checkpoint_extra(upd: int, checkpoint_modes: Sequence[str]) -> dict[str, Any]:
+        return {
+            "update": upd, "modes": list(checkpoint_modes), "device": str(device),
+            "init_checkpoint": args.init_ckpt, "ppo_config": asdict(ppo_cfg), "train_args": vars(args).copy(),
+        }
 
     actor_pool: AsyncActorPool | None = (
         AsyncActorPool(
@@ -1003,7 +1117,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         score = (float(ev["win_rate"]), float(ev.get("hidden_clear_rate", 0.0)), float(ev["avg_rounds_passed"]))
         if score > best_score:
             best_score = score
-            save_checkpoint(model, best_out, extra={"update": upd, "eval": ev, "modes": list(eval_modes), "device": device})
+            save_checkpoint(model, best_out, extra={**_checkpoint_extra(upd, eval_modes), "eval": ev})
             print(
                 f"[{label}] new best checkpoint -> {best_out} "
                 f"(win={score[0]*100:.1f}%, hid={score[1]*100:.1f}%, rounds={score[2]:.2f})",
@@ -1012,6 +1126,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     total_rl_updates = max(1, args.updates - warmup)
     mix_anneal_span = args.mix_anneal_updates if args.mix_anneal_updates > 0 else total_rl_updates
+    opening_anneal_span = args.opening_mask_anneal_updates or total_rl_updates
     mix_cursor = 0
     tgt_cursor = 0
 
@@ -1021,6 +1136,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         for upd in range(1, args.updates + 1):
             is_warmup = upd <= warmup
+            cur_mask_prob, cur_band_keep = opening_mask_schedule(
+                upd, warmup_updates=warmup, anneal_updates=opening_anneal_span,
+                prob_start=args.opening_mask_prob_start, prob_end=args.opening_mask_prob_end,
+                keep_start=args.opening_band_keep_start, keep_end=args.opening_band_keep_end,
+            )
+            ppo_cfg.opening_mask_prob = cur_mask_prob
+            ppo_cfg.opening_band_keep_ratio = cur_band_keep
             if is_warmup:
                 cur_mix = args.mix_ratio_start
                 cur_lr = args.lr
@@ -1113,6 +1235,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if u_stats.get("strategic_entropy", 0.0) > 0.0
                 else ""
             )
+            opening_info = (
+                f" bond_ent={u_stats['bond_entropy']:.3f} band_ent={u_stats['band_entropy']:.3f}"
+                f" bond_hn={u_stats['bond_entropy_normalized']:.3f} band_hn={u_stats['band_entropy_normalized']:.3f}"
+                f" bond_forced={u_stats['bond_forced_frac']:.0%}"
+                f" bond_n={u_stats['bond_entropy_samples']:.0f} band_n={u_stats['band_entropy_samples']:.0f}"
+                f" [mask_p={cur_mask_prob:.3f} band_keep={cur_band_keep:.3f}]"
+            )
             print(
                 f"[{tag}] "
                 f"win={r_stats['win_rate']*100:.1f}%{hid_info} rounds={r_stats['avg_rounds_passed']:.2f} "
@@ -1120,16 +1249,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"({r_stats['elapsed_sec']:.1f}s) | "
                 f"ploss={u_stats['policy_loss']:.4f} vloss={u_stats['value_loss']:.4f} "
                 f"ent={u_stats['entropy']:.3f} e_ent={u_stats['explore_entropy']:.2f}{strat_info} akl={u_stats['approx_kl']:.4f} "
-                f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{sched_info}{stop_flag}",
+                f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{sched_info}{opening_info}{stop_flag}",
                 flush=True,
             )
 
             if args.save_every > 0 and upd % args.save_every == 0:
-                save_checkpoint(model, args.out, extra={"update": upd, "modes": list(modes), "device": device})
+                save_checkpoint(model, args.out, extra=_checkpoint_extra(upd, modes))
             if args.eval_every > 0 and upd % args.eval_every == 0:
                 _run_eval(f"EVAL@{upd:02d}", upd)
 
-        save_checkpoint(model, args.out, extra={"update": args.updates, "modes": list(modes), "device": device})
+        save_checkpoint(model, args.out, extra=_checkpoint_extra(args.updates, modes))
         if args.eval_every <= 0 or args.updates % args.eval_every != 0:
             _run_eval("FINAL", args.updates)
     finally:

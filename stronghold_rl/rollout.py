@@ -17,7 +17,8 @@ Implements TODO.md P0 optimizations:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 import multiprocessing
 from multiprocessing.connection import Connection, wait as mp_wait
 from multiprocessing.shared_memory import SharedMemory
@@ -35,6 +36,7 @@ from .catalog import get_catalog
 from .codec import (
     CHOICE_OFFSET,
     CONT_DIM,
+    MAX_CHOICE_SLOTS,
     NUM_CAT_FIELDS,
     NUM_TOKENS,
     TYPE_BAND,
@@ -229,6 +231,65 @@ def mask_opening_diversity(
     return mask_spec
 
 
+def mask_random_opening(
+    frame: Mapping[str, Any],
+    mask_spec: ActionMaskSpec,
+    *,
+    episode_seed: int,
+    probability: float = 0.0,
+    band_keep_ratio: float = 1.0,
+) -> ActionMaskSpec:
+    """Restrict a seeded subset of training episodes to random opening choices.
+
+    The same per-episode coin gates both phases. Repeated observations never
+    reroll the subset, and a separate RNG leaves simulator randomness untouched.
+    Apply after any explicit bans; never re-enable an already filtered action.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("opening mask probability must be in [0, 1]")
+    if not 0.0 < band_keep_ratio <= 1.0:
+        raise ValueError("opening band keep ratio must be in (0, 1]")
+    phase = frame.get("phase")
+    if probability == 0.0 or phase not in ("INFO_CHECK", "BAND_DRAFT"):
+        return mask_spec
+    rng = random.Random(int(episode_seed) ^ 0x70E1A9D3)
+    if rng.random() >= probability:
+        return mask_spec
+
+    if phase == "INFO_CHECK":
+        choice = (frame.get("pub") or {}).get("bondChoice")
+        if not choice or choice.get("picked") is not None:
+            return mask_spec
+        action_type = TYPE_BOND_GROUP
+        candidates = mask_spec.src_keys.get(action_type, ())
+        if len(candidates) <= 1:
+            return mask_spec
+        kept = [rng.choice(candidates)]
+    else:
+        action_type = TYPE_BAND
+        candidates = mask_spec.src_keys.get(action_type, ())
+        # At least two strategies retain a learnable choice when possible.
+        count = min(len(candidates), max(2, math.ceil(len(candidates) * band_keep_ratio)))
+        if count >= len(candidates):
+            return mask_spec
+        selected = set(rng.sample(list(candidates), count))
+        kept = [idx for idx in candidates if idx in selected]
+
+    src_keys = dict(mask_spec.src_keys)
+    src_keys[action_type] = kept
+    tm = bytearray(mask_spec.type_mask_bytes)
+    if action_type == TYPE_BOND_GROUP and CHOICE_OFFSET not in kept:
+        # Unpicked INFO_READY implicitly chooses group 0.
+        tm[TYPE_INFO_READY] = 0
+    return replace(mask_spec, type_mask_bytes=bytes(tm), src_keys=src_keys)
+
+
+def opening_bond_mask(mask_spec: ActionMaskSpec) -> tuple[bool, ...]:
+    """Keep the entire bond choice mask even when the sampled action is INFO_READY."""
+    srcs = mask_spec.src_keys.get(TYPE_BOND_GROUP, ())
+    return tuple(CHOICE_OFFSET + i in srcs for i in range(MAX_CHOICE_SLOTS))
+
+
 def _actor_worker_main(
     slot: int,
     num_workers: int,
@@ -272,6 +333,9 @@ def _actor_worker_main(
         timeout_penalized_round = False
         ep_ban_band_idxs: frozenset[int] = frozenset()
         ep_ban_bond_ids: frozenset[str] = frozenset()
+        opening_mask_seed = 0
+        opening_mask_prob = 0.0
+        opening_band_keep_ratio = 1.0
         base_det = False
         base_temp = 1.0
 
@@ -355,6 +419,11 @@ def _actor_worker_main(
                         ban_band_idxs=ep_ban_band_idxs,
                         ban_bond_ids=ep_ban_bond_ids,
                     )
+                if opening_mask_prob > 0.0:
+                    obs_mask_spec = mask_random_opening(
+                        frame, obs_mask_spec, episode_seed=opening_mask_seed,
+                        probability=opening_mask_prob, band_keep_ratio=opening_band_keep_ratio,
+                    )
 
                 # Local fast-path 2: deterministic eval cycle-breaker
                 # Because `prep_steps` is an observed feature, 1-3 revisits can be legitimate repositioning
@@ -427,6 +496,10 @@ def _actor_worker_main(
                 track_repeat_states = bool(cfg.get("track_repeat_states", False))
                 base_det = bool(cfg["deterministic"])
                 base_temp = float(cfg["temperature"])
+                opening_mask_seed = int(seed)
+                # Evaluation resets deliberately omit these training-only options.
+                opening_mask_prob = float(cfg.get("opening_mask_prob", 0.0))
+                opening_band_keep_ratio = float(cfg.get("opening_band_keep_ratio", 1.0))
                 ban_band_pool: tuple[int, ...] = tuple(cfg.get("ban_band_idxs") or ())
                 ban_band_prob = float(cfg.get("ban_band_prob") or 0.0)
                 ban_bond_pool: tuple[str, ...] = tuple(cfg.get("ban_bond_ids") or ())
@@ -712,6 +785,8 @@ class AsyncActorPool:
         ban_band_prob: float = 0.0,
         ban_bond_ids: Sequence[str] = (),
         ban_bond_prob: float = 0.0,
+        opening_mask_prob: float = 0.0,
+        opening_band_keep_ratio: float = 1.0,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
         min_batch: int | None = None,
@@ -737,6 +812,8 @@ class AsyncActorPool:
             "ban_band_prob": float(ban_band_prob),
             "ban_bond_ids": tuple(str(b) for b in ban_bond_ids),
             "ban_bond_prob": float(ban_bond_prob),
+            "opening_mask_prob": float(opening_mask_prob),
+            "opening_band_keep_ratio": float(opening_band_keep_ratio),
         }
 
         all_episodes: list[list[dict[str, Any]]] = []
@@ -912,6 +989,7 @@ class AsyncActorPool:
                         "has_tgt": bool(act_out["has_tgt"][i].item()),
                         "opt_mask": act_out["opt_mask"][i],
                         "has_opt": bool(act_out["has_opt"][i].item()),
+                        "bond_choice_mask": opening_bond_mask(ob.mask_spec),
                         "old_log_prob": float(act_out["log_prob"][i]),
                         "value": float(act_out["value"][i]),
                         "reward": step_penalty if ob.is_prep else 0.0,

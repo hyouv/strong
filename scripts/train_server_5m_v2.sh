@@ -14,7 +14,7 @@
 #   2. Decoupled --strategic-ent-coef protects opening BAND_DRAFT / INFO_CHECK / SP_DRAFT / CHOICE entropy
 #      from 300:1 PREP-step dilution (watch `o_ent` in logs; healthy range ~0.6-2.5 during training).
 #   3. Sub-step PREP entropy weights (src=0.5, tgt=0.15, opt=0.15) prevent 36x4 MOVE entropy hacking.
-#   4. Intra-round GAE alignment (--round-discount --gamma-round 0.97 --gae-lambda-intra 0.99) gives Round-0
+#   4. Intra-round GAE alignment (--round-discount --gamma-round 0.97 --gae-lambda-intra 1.0) gives Round-0
 #      band/bond decisions real end-of-match credit instead of noisy early Critic estimates.
 #   5. 5-update critic warmup + tighter --target-kl 0.04 + gentle LR (2.5e-5 -> 3e-6) prevent single-batch
 #      opening spikes; KL anchor anneals cleanly to 0.0 so late-stage RL is never capped by earlier stages.
@@ -82,7 +82,21 @@ PPO_EPOCHS="${PPO_EPOCHS:-2}"
 PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 PPO_TARGET_KL="${PPO_TARGET_KL:-0.04}"
 PPO_GAMMA_ROUND="${PPO_GAMMA_ROUND:-0.97}"
-PPO_GAE_LAMBDA_INTRA="${PPO_GAE_LAMBDA_INTRA:-0.99}"
+PPO_GAE_LAMBDA_INTRA="${PPO_GAE_LAMBDA_INTRA:-1.0}"
+
+# Opt-in random opening curriculum. Evaluation always uses the full legal set.
+PPO_OPENING_MASK_PROB_START="${PPO_OPENING_MASK_PROB_START:-0.0}"
+PPO_OPENING_MASK_PROB_END="${PPO_OPENING_MASK_PROB_END:-0.0}"
+PPO_OPENING_BAND_KEEP_START="${PPO_OPENING_BAND_KEEP_START:-1.0}"
+PPO_OPENING_BAND_KEEP_END="${PPO_OPENING_BAND_KEEP_END:-1.0}"
+PPO_OPENING_MASK_ANNEAL_UPDATES="${PPO_OPENING_MASK_ANNEAL_UPDATES:-0}"
+OPENING_MASK_ARGS=(
+  --opening-mask-prob-start "${PPO_OPENING_MASK_PROB_START}"
+  --opening-mask-prob-end "${PPO_OPENING_MASK_PROB_END}"
+  --opening-band-keep-start "${PPO_OPENING_BAND_KEEP_START}"
+  --opening-band-keep-end "${PPO_OPENING_BAND_KEEP_END}"
+  --opening-mask-anneal-updates "${PPO_OPENING_MASK_ANNEAL_UPDATES}"
+)
 
 PPO_STEP_PENALTY="${PPO_STEP_PENALTY:--0.0005}"
 PPO_PREP_TIMEOUT_PENALTY="${PPO_PREP_TIMEOUT_PENALTY:--0.25}"
@@ -302,6 +316,7 @@ run_normal() {
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${NORMAL_STRATEGIC_ENT_COEF}" \
     --strategic-ent-coef-end "${NORMAL_STRATEGIC_ENT_COEF_END}" \
+    "${OPENING_MASK_ARGS[@]}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
     --opt-ent-weight "${PPO_OPT_ENT_WEIGHT}" \
@@ -363,6 +378,7 @@ run_hard() {
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${HARD_STRATEGIC_ENT_COEF}" \
     --strategic-ent-coef-end "${HARD_STRATEGIC_ENT_COEF_END}" \
+    "${OPENING_MASK_ARGS[@]}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
     --opt-ent-weight "${PPO_OPT_ENT_WEIGHT}" \
@@ -424,6 +440,7 @@ run_abyss() {
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${ABYSS_STRATEGIC_ENT_COEF}" \
     --strategic-ent-coef-end "${ABYSS_STRATEGIC_ENT_COEF_END}" \
+    "${OPENING_MASK_ARGS[@]}" \
     --ban-bands "${ABYSS_BAN_BANDS}" \
     --ban-band-prob "${ABYSS_BAN_BAND_PROB}" \
     --ban-bond-groups "${ABYSS_BAN_BOND_GROUPS}" \
