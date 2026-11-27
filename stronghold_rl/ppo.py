@@ -33,7 +33,7 @@ from .bc import (
 from .catalog import GameCatalog, get_catalog
 from .codec import encode_frame
 from .model import PolicyConfig, StepMasks, StrongholdPolicyNet
-from .rollout import STRATEGIC_ACTION_TYPES, AsyncActorPool
+from .rollout import STRATEGIC_ACTION_TYPES, AsyncActorPool, prep_state_signature
 
 
 @dataclass
@@ -61,6 +61,8 @@ class PPOConfig:
     max_prep_steps_per_round: int = 80
     # Reward shaping (solo curriculum)
     step_penalty: float = -0.0005
+    prep_timeout_penalty: float = 0.0   # extra penalty (once per round) when hitting max_prep_steps_per_round
+    repeat_state_penalty: float = 0.0   # extra penalty each time a PREP action returns to a previously visited state
     round_survive_bonus: float = 0.06
     lp_loss_penalty: float = -0.025
     victory_reward: float = 1.0
@@ -286,6 +288,8 @@ def collect_ppo_rollouts(
                 victory_reward=cfg.victory_reward,
                 defeat_reward=cfg.defeat_reward,
                 hidden_clear_bonus=cfg.hidden_clear_bonus,
+                prep_timeout_penalty=cfg.prep_timeout_penalty,
+                repeat_state_penalty=cfg.repeat_state_penalty,
                 max_prep_steps_per_round=cfg.max_prep_steps_per_round,
                 sampling_temperature=sampling_temperature,
                 min_batch=min_batch if min_batch > 0 else None,
@@ -313,6 +317,7 @@ def collect_ppo_rollouts(
     hidden_clears = 0
     rounds_passed: list[int] = []
     forced_readies = 0
+    repeat_states = 0
     mode_sched = episode_modes if episode_modes else modes
 
     with RoomPool(num_workers=n_workers) as sync_pool:
@@ -322,6 +327,8 @@ def collect_ppo_rollouts(
         ep_prev_round: dict[int, int] = {}
         ep_prev_lp: dict[int, int] = {}
         ep_prep_steps: dict[int, int] = {}
+        ep_seen_sigs: dict[int, dict[tuple[Any, ...], int]] = {}
+        ep_timeout_penalized: dict[int, bool] = {}
 
         def _spawn_cmd(ep_idx: int) -> dict[str, Any]:
             return {
@@ -338,6 +345,8 @@ def collect_ppo_rollouts(
             ep_prev_round[w] = -1
             ep_prev_lp[w] = -1
             ep_prep_steps[w] = 0
+            ep_seen_sigs[w] = {}
+            ep_timeout_penalized[w] = False
             next_ep += 1
         active_frames = sync_pool.exchange(init_cmds)
 
@@ -357,8 +366,12 @@ def collect_ppo_rollouts(
                     ep_buf[w][-1].reward += cfg.round_survive_bonus * r_delta + cfg.lp_loss_penalty * lp_lost
                     ep_buf[w][-1].round_end = True
                     ep_prep_steps[w] = 0
+                    ep_seen_sigs[w].clear()
+                    ep_timeout_penalized[w] = False
                 elif rnd != ep_prev_round[w]:
                     ep_prep_steps[w] = 0
+                    ep_seen_sigs[w].clear()
+                    ep_timeout_penalized[w] = False
 
                 ep_prev_round[w] = rnd
                 ep_prev_lp[w] = lp
@@ -366,6 +379,10 @@ def collect_ppo_rollouts(
                 enc = encode_frame(frame, cat, prep_steps=ep_prep_steps[w])
                 if frame["phase"] == "PREP" and ep_prep_steps[w] >= cfg.max_prep_steps_per_round:
                     forced_readies += 1
+                    if not ep_timeout_penalized[w]:
+                        ep_timeout_penalized[w] = True
+                        if ep_buf[w] and cfg.prep_timeout_penalty != 0.0:
+                            ep_buf[w][-1].reward += cfg.prep_timeout_penalty
                     action_key = pick_force_unblock_action(enc)
                     step_cmds[w] = {
                         "op": "step",
@@ -374,6 +391,14 @@ def collect_ppo_rollouts(
                         "policy_version": 0,
                     }
                 else:
+                    if frame["phase"] == "PREP":
+                        sig = prep_state_signature(frame)
+                        visits = ep_seen_sigs[w].get(sig, 0)
+                        ep_seen_sigs[w][sig] = visits + 1
+                        if ep_buf[w] and visits >= 1:
+                            repeat_states += 1
+                            if cfg.repeat_state_penalty != 0.0:
+                                ep_buf[w][-1].reward += cfg.repeat_state_penalty
                     batch_workers.append(w)
                     batch_frames.append(frame)
                     batch_encs.append(enc)
@@ -438,6 +463,8 @@ def collect_ppo_rollouts(
                     ep_prev_round[w] = -1
                     ep_prev_lp[w] = -1
                     ep_prep_steps[w] = 0
+                    ep_seen_sigs[w].clear()
+                    ep_timeout_penalized[w] = False
                     if next_ep < num_episodes:
                         reset_cmds[w] = _spawn_cmd(next_ep)
                         next_ep += 1
@@ -486,6 +513,7 @@ def collect_ppo_rollouts(
         "hidden_clears": hidden_clears,
         "avg_rounds_passed": sum(rounds_passed) / max(1, len(rounds_passed)),
         "forced_readies": forced_readies,
+        "repeat_states": repeat_states,
         "sim_errors": 0,
         "elapsed_sec": round(time.perf_counter() - t0, 2),
     }
@@ -668,6 +696,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--round-discount", action="store_true", help="Use intra-round gamma_intra=1.0 and cross-round gamma_round")
     parser.add_argument("--gamma-intra", type=float, default=-1.0, help="Override intra-round gamma (>=0 enables round-boundary discounting)")
     parser.add_argument("--gamma-round", type=float, default=0.97, help="Cross-round discount factor at combat boundaries")
+    parser.add_argument("--step-penalty", type=float, default=-0.0005, help="Per-PREP-step penalty")
+    parser.add_argument("--prep-timeout-penalty", type=float, default=0.0, help="Extra penalty once per round on PREP step cap timeout")
+    parser.add_argument("--repeat-state-penalty", type=float, default=0.0, help="Extra penalty when a PREP action returns to a visited state")
     parser.add_argument("--round-survive-bonus", type=float, default=0.06)
     parser.add_argument("--lp-loss-penalty", type=float, default=-0.025)
     parser.add_argument("--victory-reward", type=float, default=1.0)
@@ -736,6 +767,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         kl_coef=args.kl_coef if ref_model is not None else 0.0,
         target_kl=args.target_kl,
         minibatch_size=args.minibatch_size,
+        step_penalty=args.step_penalty,
+        prep_timeout_penalty=args.prep_timeout_penalty,
+        repeat_state_penalty=args.repeat_state_penalty,
         round_survive_bonus=args.round_survive_bonus,
         lp_loss_penalty=args.lp_loss_penalty,
         victory_reward=args.victory_reward,
@@ -866,6 +900,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             stop_flag = " [KL-STOP]" if u_stats["early_stopped"] > 0 else ""
             bs_info = f" bs={r_stats['avg_batch_size']:.1f}" if "avg_batch_size" in r_stats else ""
             hid_info = f" hid={r_stats['hidden_clears']}" if r_stats.get("hidden_clears", 0) > 0 else ""
+            rep_info = f" rep_st={r_stats['repeat_states']}" if r_stats.get("repeat_states", 0) > 0 else ""
             err_info = f" sim_err={r_stats['sim_errors']}" if r_stats.get("sim_errors", 0) > 0 else ""
             sched_info = ""
             if mix_modes or args.ent_coef_end >= 0.0 or args.kl_coef_end >= 0.0 or args.lr_end >= 0.0:
@@ -874,7 +909,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(
                 f"[{tag}] "
                 f"win={r_stats['win_rate']*100:.1f}%{hid_info} rounds={r_stats['avg_rounds_passed']:.2f} "
-                f"steps={r_stats['transitions']} forced_rdy={r_stats['forced_readies']}{bs_info}{err_info} "
+                f"steps={r_stats['transitions']} forced_rdy={r_stats['forced_readies']}{rep_info}{bs_info}{err_info} "
                 f"({r_stats['elapsed_sec']:.1f}s) | "
                 f"ploss={u_stats['policy_loss']:.4f} vloss={u_stats['value_loss']:.4f} "
                 f"ent={u_stats['entropy']:.3f} e_ent={u_stats['explore_entropy']:.2f}{strat_info} akl={u_stats['approx_kl']:.4f} "

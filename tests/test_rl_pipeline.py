@@ -541,3 +541,41 @@ def test_prep_state_signature_and_cycle_masking() -> None:
     same_spec, did_mask2 = mask_cycle_action_types(spec_only)
     assert did_mask2 is False
     assert same_spec.type_mask_bytes[TYPE_MOVE] == 1
+
+
+def test_prep_timeout_and_repeat_state_penalties() -> None:
+    """Verify prep_timeout_penalty and repeat_state_penalty wire through AsyncActorPool and sync rollout."""
+    cat = get_catalog()
+    model = StrongholdPolicyNet(catalog=cat, config=PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128))
+    cfg = PPOConfig(
+        max_prep_steps_per_round=12,
+        prep_timeout_penalty=-0.10,
+        repeat_state_penalty=-0.005,
+        kl_coef=0.0,
+    )
+    batch_async, stats_async = collect_ppo_rollouts(
+        model,
+        num_episodes=2,
+        modes=("mode_single_1",),
+        seed_start=25000,
+        num_workers=2,
+        ppo_cfg=cfg,
+        catalog=cat,
+    )
+    assert stats_async["episodes"] == 2
+    assert "repeat_states" in stats_async and stats_async["repeat_states"] >= 0
+    assert torch.isfinite(batch_async["returns"]).all()
+
+    batch_sync, stats_sync = collect_ppo_rollouts(
+        model,
+        num_episodes=1,
+        modes=("mode_single_1",),
+        seed_start=25010,
+        num_workers=1,
+        ppo_cfg=cfg,
+        catalog=cat,
+        use_async_pool=False,
+    )
+    assert stats_sync["episodes"] == 1
+    assert "repeat_states" in stats_sync and stats_sync["repeat_states"] >= 0
+    assert torch.isfinite(batch_sync["returns"]).all()

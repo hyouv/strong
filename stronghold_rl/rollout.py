@@ -207,16 +207,20 @@ def _actor_worker_main(
         max_prep_steps = 80
         max_total_steps = 0
         break_cycles = False
+        track_repeat_states = False
+        timeout_penalized_round = False
         base_det = False
         base_temp = 1.0
 
         def _advance_frame(frame: dict[str, Any]) -> None:
             nonlocal client, ep_steps, ep_prep_steps, ep_prev_round, ep_prev_lp
-            nonlocal cur_dec, cur_decision_id, cur_phase, has_transition
+            nonlocal cur_dec, cur_decision_id, cur_phase, has_transition, timeout_penalized_round
 
             pending_r_delta = 0
             pending_lp_lost = 0
             forced_delta = 0
+            timeout_delta = 0
+            repeat_delta = 0
             cycle_delta = 0
 
             while True:
@@ -232,6 +236,8 @@ def _actor_worker_main(
                             int(frame.get("lastRound", 14)),
                             ep_steps,
                             forced_delta,
+                            timeout_delta,
+                            repeat_delta,
                             cycle_delta,
                             pending_r_delta,
                             pending_lp_lost,
@@ -248,9 +254,11 @@ def _actor_worker_main(
                     pending_lp_lost += max(0, ep_prev_lp - lp)
                     ep_prep_steps = 0
                     ep_seen_sigs.clear()
+                    timeout_penalized_round = False
                 elif rnd != ep_prev_round:
                     ep_prep_steps = 0
                     ep_seen_sigs.clear()
+                    timeout_penalized_round = False
 
                 ep_prev_round = rnd
                 ep_prev_lp = lp
@@ -262,6 +270,9 @@ def _actor_worker_main(
                 # Local fast-path 1: prep step limit guardrail (no GPU round-trip needed)
                 if phase == "PREP" and ep_prep_steps >= max_prep_steps:
                     forced_delta += 1
+                    if not timeout_penalized_round:
+                        timeout_penalized_round = True
+                        timeout_delta += 1
                     action_key = dec.pick_force_unblock_action()
                     ep_prep_steps += 1
                     ep_steps += 1
@@ -294,6 +305,12 @@ def _actor_worker_main(
                         if visits >= 2 or not masked:
                             req_det = False
                             req_temp = max(base_temp, 0.7) if base_temp > 0.0 else 0.7
+                elif track_repeat_states and phase == "PREP":
+                    sig = prep_state_signature(frame)
+                    visits = ep_seen_sigs.get(sig, 0)
+                    ep_seen_sigs[sig] = visits + 1
+                    if has_transition and visits >= 1:
+                        repeat_delta += 1
 
                 cur_dec = dec
                 cur_decision_id = int(frame["decision_id"])
@@ -310,6 +327,8 @@ def _actor_worker_main(
                         pending_r_delta,
                         pending_lp_lost,
                         forced_delta,
+                        timeout_delta,
+                        repeat_delta,
                         cycle_delta,
                         obs_mask_spec,
                     )
@@ -326,6 +345,7 @@ def _actor_worker_main(
                 max_prep_steps = int(cfg["max_prep_steps"])
                 max_total_steps = int(cfg["max_total_steps"])
                 break_cycles = bool(cfg["break_cycles"])
+                track_repeat_states = bool(cfg.get("track_repeat_states", False))
                 base_det = bool(cfg["deterministic"])
                 base_temp = float(cfg["temperature"])
 
@@ -334,6 +354,7 @@ def _actor_worker_main(
                 ep_prev_round = -1
                 ep_prev_lp = -1
                 ep_seen_sigs.clear()
+                timeout_penalized_round = False
                 cur_dec = None
                 cur_decision_id = -1
                 cur_phase = ""
@@ -394,6 +415,8 @@ class _PendingObs:
     r_delta: int
     lp_lost: int
     forced_delta: int
+    timeout_delta: int
+    repeat_delta: int
     cycle_delta: int
     mask_spec: ActionMaskSpec
 
@@ -536,8 +559,10 @@ class AsyncActorPool:
                             r_delta=msg[6],
                             lp_lost=msg[7],
                             forced_delta=msg[8],
-                            cycle_delta=msg[9],
-                            mask_spec=msg[10],
+                            timeout_delta=msg[9],
+                            repeat_delta=msg[10],
+                            cycle_delta=msg[11],
+                            mask_spec=msg[12],
                         )
                     )
                 elif tag == "fatal":
@@ -578,6 +603,8 @@ class AsyncActorPool:
         victory_reward: float,
         defeat_reward: float,
         hidden_clear_bonus: float = 0.0,
+        prep_timeout_penalty: float = 0.0,
+        repeat_state_penalty: float = 0.0,
         episode_modes: Sequence[str] | None = None,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
@@ -597,6 +624,7 @@ class AsyncActorPool:
             "max_prep_steps": max_prep_steps_per_round,
             "max_total_steps": 0,
             "break_cycles": False,
+            "track_repeat_states": True,
             "deterministic": False,
             "temperature": float(sampling_temperature),
         }
@@ -607,6 +635,7 @@ class AsyncActorPool:
         hidden_clears = 0
         rounds_passed: list[int] = []
         forced_readies = 0
+        repeat_states = 0
         sim_errors = 0
         num_gpu_batches = 0
         total_gpu_items = 0
@@ -650,8 +679,9 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, _ep_id, win, rnds, last_rnd, _steps, f_delta, _c_delta, r_delta, lp_lost, _to = ev
+                    _, slot, _ep_id, win, rnds, last_rnd, _steps, f_delta, to_delta, rep_delta, _c_delta, r_delta, lp_lost, _to = ev
                     forced_readies += f_delta
+                    repeat_states += rep_delta
                     in_progress_target -= 1
                     hid_cleared = bool(win and rnds > last_rnd)
                     if win:
@@ -661,6 +691,10 @@ class AsyncActorPool:
                     rounds_passed.append(rnds)
                     buf = ep_buf.pop(slot, [])
                     if buf:
+                        if to_delta > 0 and prep_timeout_penalty != 0.0:
+                            buf[-1]["reward"] += prep_timeout_penalty * to_delta
+                        if rep_delta > 0 and repeat_state_penalty != 0.0:
+                            buf[-1]["reward"] += repeat_state_penalty * rep_delta
                         if r_delta > 0:
                             buf[-1]["reward"] += round_survive_bonus * r_delta + lp_loss_penalty * lp_lost
                             buf[-1]["round_end"] = True
@@ -687,13 +721,19 @@ class AsyncActorPool:
             if not obs_list:
                 continue
 
-            # Apply any pending inter-round rewards before stepping the next action
+            # Apply any pending inter-round / timeout / repeat-state rewards before stepping the next action
             for ob in obs_list:
                 forced_readies += ob.forced_delta
+                repeat_states += ob.repeat_delta
                 buf = ep_buf[ob.slot]
-                if buf and ob.r_delta > 0:
-                    buf[-1]["reward"] += round_survive_bonus * ob.r_delta + lp_loss_penalty * ob.lp_lost
-                    buf[-1]["round_end"] = True
+                if buf:
+                    if ob.timeout_delta > 0 and prep_timeout_penalty != 0.0:
+                        buf[-1]["reward"] += prep_timeout_penalty * ob.timeout_delta
+                    if ob.repeat_delta > 0 and repeat_state_penalty != 0.0:
+                        buf[-1]["reward"] += repeat_state_penalty * ob.repeat_delta
+                    if ob.r_delta > 0:
+                        buf[-1]["reward"] += round_survive_bonus * ob.r_delta + lp_loss_penalty * ob.lp_lost
+                        buf[-1]["round_end"] = True
 
             # Vectorized SharedMemory read -> fresh owned CPU tensors (safe to reuse slots immediately after)
             slots = [ob.slot for ob in obs_list]
@@ -757,6 +797,7 @@ class AsyncActorPool:
             "hidden_clears": hidden_clears,
             "avg_rounds_passed": sum(rounds_passed) / max(1, len(rounds_passed)),
             "forced_readies": forced_readies,
+            "repeat_states": repeat_states,
             "sim_errors": sim_errors,
             "avg_batch_size": round(total_gpu_items / max(1, num_gpu_batches), 2),
             "gpu_batches": num_gpu_batches,
@@ -850,7 +891,7 @@ class AsyncActorPool:
             for ev in events:
                 tag = ev[0]
                 if tag == "done":
-                    _, slot, done_ep_id, win, rnds, last_rnd, steps, f_delta, c_delta, _r_d, _lp_l, _to = ev
+                    _, slot, done_ep_id, win, rnds, last_rnd, steps, f_delta, _to_d, _rep_d, c_delta, _r_d, _lp_l, _to = ev
                     ok_eps += 1
                     forced_readies += f_delta
                     cycle_breaks += c_delta
