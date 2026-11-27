@@ -22,6 +22,7 @@ import multiprocessing
 from multiprocessing.connection import Connection, wait as mp_wait
 from multiprocessing.shared_memory import SharedMemory
 import os
+import random
 import time
 from typing import Any, Mapping, Sequence
 
@@ -32,6 +33,7 @@ from stronghold_sim import RoomClient, WorkerError
 
 from .catalog import get_catalog
 from .codec import (
+    CHOICE_OFFSET,
     CONT_DIM,
     NUM_CAT_FIELDS,
     NUM_TOKENS,
@@ -41,6 +43,7 @@ from .codec import (
     TYPE_CHOICE,
     TYPE_COMMAND_CHOICE,
     TYPE_FREEZE,
+    TYPE_INFO_READY,
     TYPE_MOVE,
     TYPE_READY,
     ActionMaskSpec,
@@ -168,6 +171,64 @@ def mask_cycle_action_types(mask_spec: ActionMaskSpec) -> tuple[ActionMaskSpec, 
     )
 
 
+def mask_opening_diversity(
+    frame: Mapping[str, Any],
+    mask_spec: ActionMaskSpec,
+    *,
+    ban_band_idxs: frozenset[int] = frozenset(),
+    ban_bond_ids: frozenset[str] = frozenset(),
+) -> ActionMaskSpec:
+    """Optionally mask dominant opening bands or core bond groups during training rollouts.
+
+    Strictly preserves at least one legal option and returns an exact `ActionMaskSpec` so
+    PPO `old_log_prob` and `evaluate_batch` stay 100% on-policy.
+    """
+    phase = frame.get("phase")
+    if phase == "BAND_DRAFT" and ban_band_idxs:
+        band_srcs = mask_spec.src_keys.get(TYPE_BAND)
+        if band_srcs:
+            kept = [idx for idx in band_srcs if idx not in ban_band_idxs]
+            if kept and len(kept) < len(band_srcs):
+                new_src_keys = dict(mask_spec.src_keys)
+                new_src_keys[TYPE_BAND] = kept
+                return ActionMaskSpec(
+                    type_mask_bytes=mask_spec.type_mask_bytes,
+                    src_keys=new_src_keys,
+                    tgt_keys=mask_spec.tgt_keys,
+                    opt_bits=mask_spec.opt_bits,
+                    num_bands=mask_spec.num_bands,
+                )
+    elif phase == "INFO_CHECK" and ban_bond_ids:
+        bc = (frame.get("pub") or {}).get("bondChoice")
+        if bc and bc.get("picked") is None:
+            groups = bc.get("groups") or ()
+            bg_srcs = mask_spec.src_keys.get(TYPE_BOND_GROUP)
+            if bg_srcs:
+                banned_slots: set[int] = set()
+                group0_banned = False
+                for idx, grp in enumerate(groups):
+                    if any(b in ban_bond_ids for b in (grp or ())):
+                        banned_slots.add(CHOICE_OFFSET + idx)
+                        if idx == 0:
+                            group0_banned = True
+                kept = [s for s in bg_srcs if s not in banned_slots]
+                if kept and len(kept) < len(bg_srcs):
+                    new_src_keys = dict(mask_spec.src_keys)
+                    new_src_keys[TYPE_BOND_GROUP] = kept
+                    tm = bytearray(mask_spec.type_mask_bytes)
+                    # INFO_READY before picking defaults to group 0, so suppress it if group 0 is banned.
+                    if group0_banned and tm[TYPE_INFO_READY]:
+                        tm[TYPE_INFO_READY] = 0
+                    return ActionMaskSpec(
+                        type_mask_bytes=bytes(tm),
+                        src_keys=new_src_keys,
+                        tgt_keys=mask_spec.tgt_keys,
+                        opt_bits=mask_spec.opt_bits,
+                        num_bands=mask_spec.num_bands,
+                    )
+    return mask_spec
+
+
 def _actor_worker_main(
     slot: int,
     num_workers: int,
@@ -209,6 +270,8 @@ def _actor_worker_main(
         break_cycles = False
         track_repeat_states = False
         timeout_penalized_round = False
+        ep_ban_band_idxs: frozenset[int] = frozenset()
+        ep_ban_bond_ids: frozenset[str] = frozenset()
         base_det = False
         base_temp = 1.0
 
@@ -285,6 +348,13 @@ def _actor_worker_main(
                 req_det = base_det
                 req_temp = base_temp
                 obs_mask_spec = dec.mask_spec
+                if ep_ban_band_idxs or ep_ban_bond_ids:
+                    obs_mask_spec = mask_opening_diversity(
+                        frame,
+                        obs_mask_spec,
+                        ban_band_idxs=ep_ban_band_idxs,
+                        ban_bond_ids=ep_ban_bond_ids,
+                    )
 
                 # Local fast-path 2: deterministic eval cycle-breaker
                 # Suppress oscillating MOVE/FREEZE on repeat visits instead of prematurely aborting prep
@@ -350,6 +420,21 @@ def _actor_worker_main(
                 track_repeat_states = bool(cfg.get("track_repeat_states", False))
                 base_det = bool(cfg["deterministic"])
                 base_temp = float(cfg["temperature"])
+                ban_band_pool: tuple[int, ...] = tuple(cfg.get("ban_band_idxs") or ())
+                ban_band_prob = float(cfg.get("ban_band_prob") or 0.0)
+                ban_bond_pool: tuple[str, ...] = tuple(cfg.get("ban_bond_ids") or ())
+                ban_bond_prob = float(cfg.get("ban_bond_prob") or 0.0)
+                if (ban_band_pool and ban_band_prob > 0.0) or (ban_bond_pool and ban_bond_prob > 0.0):
+                    ep_rng = random.Random((int(seed) ^ 0x51A7BEEF) + int(ep_id) * 131)
+                    ep_ban_band_idxs = (
+                        frozenset(ban_band_pool) if (ban_band_pool and ep_rng.random() < ban_band_prob) else frozenset()
+                    )
+                    ep_ban_bond_ids = (
+                        frozenset(ban_bond_pool) if (ban_bond_pool and ep_rng.random() < ban_bond_prob) else frozenset()
+                    )
+                else:
+                    ep_ban_band_idxs = frozenset()
+                    ep_ban_bond_ids = frozenset()
 
                 ep_steps = 0
                 ep_prep_steps = 0
@@ -616,6 +701,10 @@ class AsyncActorPool:
         repeat_state_penalty: float = 0.0,
         episode_modes: Sequence[str] | None = None,
         episode_bosses: Sequence[str | None] | None = None,
+        ban_band_idxs: Sequence[int] = (),
+        ban_band_prob: float = 0.0,
+        ban_bond_ids: Sequence[str] = (),
+        ban_bond_prob: float = 0.0,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
         min_batch: int | None = None,
@@ -637,6 +726,10 @@ class AsyncActorPool:
             "track_repeat_states": True,
             "deterministic": False,
             "temperature": float(sampling_temperature),
+            "ban_band_idxs": tuple(int(i) for i in ban_band_idxs),
+            "ban_band_prob": float(ban_band_prob),
+            "ban_bond_ids": tuple(str(b) for b in ban_bond_ids),
+            "ban_bond_prob": float(ban_bond_prob),
         }
 
         all_episodes: list[list[dict[str, Any]]] = []

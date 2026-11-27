@@ -50,7 +50,7 @@ from stronghold_rl.ppo import (
     parse_boss_weights,
     ppo_update,
 )
-from stronghold_rl.rollout import AsyncActorPool, mask_cycle_action_types, prep_state_signature
+from stronghold_rl.rollout import AsyncActorPool, mask_cycle_action_types, mask_opening_diversity, prep_state_signature
 
 
 def test_solo_mode_codec_bijection_and_logprob_consistency() -> None:
@@ -685,3 +685,89 @@ def test_boss_curriculum_and_boss_damage_shaping() -> None:
         )
         assert ev["episodes"] == 2
         assert sum(v["episodes"] for v in ev["by_boss"].values()) == 2
+
+
+def test_decoupled_strategic_entropy_and_opening_diversity_masking() -> None:
+    """Verify opening band/bond masking stays 100% on-policy and decoupled strategic entropy updates cleanly."""
+    from stronghold_rl.codec import (
+        CHOICE_OFFSET,
+        NUM_ACTION_TYPES,
+        TYPE_BAND,
+        TYPE_BOND_GROUP,
+        TYPE_INFO_READY,
+        ActionMaskSpec,
+    )
+
+    cat = get_catalog()
+    cannot_idx = cat.band_to_idx["band_cannot"]
+
+    # 1. BAND_DRAFT: ban band_cannot while keeping alternatives
+    tm_band = bytearray(NUM_ACTION_TYPES)
+    tm_band[TYPE_BAND] = 1
+    spec_band = ActionMaskSpec(
+        type_mask_bytes=bytes(tm_band),
+        src_keys={TYPE_BAND: [0, cannot_idx, (cannot_idx + 1) % cat.num_bands]},
+        tgt_keys={},
+        opt_bits={},
+        num_bands=cat.num_bands,
+    )
+    masked_band = mask_opening_diversity({"phase": "BAND_DRAFT"}, spec_band, ban_band_idxs=frozenset({cannot_idx}))
+    assert cannot_idx not in masked_band.src_keys[TYPE_BAND]
+    assert len(masked_band.src_keys[TYPE_BAND]) >= 1
+
+    # 2. INFO_CHECK: banning group 0 containing lethaniaShip must also mask TYPE_INFO_READY
+    tm_info = bytearray(NUM_ACTION_TYPES)
+    tm_info[TYPE_BOND_GROUP] = 1
+    tm_info[TYPE_INFO_READY] = 1
+    spec_info = ActionMaskSpec(
+        type_mask_bytes=bytes(tm_info),
+        src_keys={TYPE_BOND_GROUP: [CHOICE_OFFSET + 0, CHOICE_OFFSET + 1]},
+        tgt_keys={},
+        opt_bits={},
+        num_bands=cat.num_bands,
+    )
+    info_frame = {
+        "phase": "INFO_CHECK",
+        "pub": {"bondChoice": {"picked": None, "groups": [["lethaniaShip", "victoria"], ["sami", "kjerag"]]}},
+    }
+    masked_info = mask_opening_diversity(info_frame, spec_info, ban_bond_ids=frozenset({"lethaniaShip"}))
+    assert masked_info.src_keys[TYPE_BOND_GROUP] == [CHOICE_OFFSET + 1]
+    assert masked_info.type_mask_bytes[TYPE_INFO_READY] == 0
+
+    # 3. End-to-end rollout with 100% band & bond banning must remain 100% exact on-policy with evaluate_batch
+    model = StrongholdPolicyNet(catalog=cat, config=PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128))
+    model.eval()
+    ppo_cfg = PPOConfig(
+        max_prep_steps_per_round=15,
+        strategic_ent_coef=0.05,
+        ban_bands=("band_cannot",),
+        ban_band_prob=1.0,
+        ban_bond_groups=("lethaniaShip",),
+        ban_bond_group_prob=1.0,
+        kl_coef=0.0,
+    )
+    rollout, r_stats = collect_ppo_rollouts(
+        model,
+        num_episodes=2,
+        modes=("mode_single_15",),
+        seed_start=27000,
+        num_workers=2,
+        ppo_cfg=ppo_cfg,
+        catalog=cat,
+    )
+    assert r_stats["episodes"] == 2
+    # band_cannot must never be chosen when banned with prob=1.0
+    band_rows = rollout["a_type"] == TYPE_BAND
+    assert bool(band_rows.any())
+    assert not bool((rollout["a_src"][band_rows] == cannot_idx).any())
+    assert not bool(rollout["band_mask"][band_rows, cannot_idx].any())
+
+    with torch.no_grad():
+        ev_out = model.evaluate_batch(rollout)
+    max_lp_diff = float((ev_out["log_prob"] - rollout["old_log_prob"]).abs().max().item())
+    assert max_lp_diff < 1e-4, f"Opening diversity mask broke on-policy log_prob parity: {max_lp_diff}"
+
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    u_stats = ppo_update(model, opt, rollout, cfg=ppo_cfg)
+    assert "opening_entropy" in u_stats and u_stats["opening_entropy"] >= 0.0
+    assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())

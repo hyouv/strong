@@ -10,7 +10,7 @@ Features:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -32,9 +32,9 @@ from .bc import (
     save_checkpoint,
 )
 from .catalog import GameCatalog, get_catalog
-from .codec import encode_frame
+from .codec import TYPE_BAND, TYPE_BOND_GROUP, encode_frame
 from .model import PolicyConfig, StepMasks, StrongholdPolicyNet
-from .rollout import STRATEGIC_ACTION_TYPES, AsyncActorPool, prep_state_signature
+from .rollout import STRATEGIC_ACTION_TYPES, AsyncActorPool, mask_opening_diversity, prep_state_signature
 
 
 @dataclass
@@ -48,6 +48,7 @@ class PPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     strategic_ent_mult: float = 1.0   # extra entropy weight on macro-strategic steps (band/bond/SP/choice)
+    strategic_ent_coef: float = 0.0   # decoupled entropy bonus over strategic transitions only (prevents PREP dilution)
     src_ent_weight: float = 0.5       # weight of step-2 source-pointer entropy on non-strategic steps
     tgt_ent_weight: float = 0.15      # weight of step-3 target-pointer entropy (prevents 36-tile MOVE entropy hacking)
     opt_ent_weight: float = 0.15      # weight of step-4 facing/replace-slot entropy on non-strategic steps
@@ -71,6 +72,11 @@ class PPOConfig:
     defeat_reward: float = -1.0
     hidden_clear_bonus: float = 0.0   # extra reward when clearing Hidden Core (round 15)
     boss_dmg_defeat_bonus: float = 0.0  # shaped terminal credit on defeat: +bonus * boss_dmg_ratio (R14 boss HP dealt)
+    # Opening diversity exploration (training-only legal-mask filtering; never applied in eval)
+    ban_bands: tuple[str, ...] = ()
+    ban_band_prob: float = 0.0
+    ban_bond_groups: tuple[str, ...] = ()
+    ban_bond_group_prob: float = 0.0
 
 
 @dataclass
@@ -135,6 +141,14 @@ def build_curriculum_episode_modes(
             out.append(mix_modes[(mix_offset + mi) % len(mix_modes)])
             mi += 1
     return out
+
+
+def parse_id_list(spec: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of entity/band/bond IDs into a deduplicated tuple."""
+    raw = spec.strip()
+    if not raw:
+        return ()
+    return tuple(dict.fromkeys(tok.strip() for tok in raw.split(",") if tok.strip()))
 
 
 def parse_boss_weights(spec: str) -> dict[str, float]:
@@ -343,6 +357,15 @@ def collect_ppo_rollouts(
     t0 = time.perf_counter()
     n_workers = max(1, min(num_workers, num_episodes))
 
+    ban_band_idxs: list[int] = []
+    for bid in cfg.ban_bands:
+        if bid not in cat.band_to_idx:
+            raise ValueError(f"Unknown bandId in ban_bands: {bid!r}")
+        ban_band_idxs.append(cat.band_to_idx[bid])
+    for bid in cfg.ban_bond_groups:
+        if bid not in cat.bond_to_idx:
+            raise ValueError(f"Unknown bondId in ban_bond_groups: {bid!r}")
+
     if pool is not None or (use_async_pool and n_workers >= 2):
         def _run_with_pool(active_pool: AsyncActorPool) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
             return active_pool.collect_ppo_episodes(
@@ -361,6 +384,10 @@ def collect_ppo_rollouts(
                 boss_dmg_defeat_bonus=cfg.boss_dmg_defeat_bonus,
                 prep_timeout_penalty=cfg.prep_timeout_penalty,
                 repeat_state_penalty=cfg.repeat_state_penalty,
+                ban_band_idxs=tuple(ban_band_idxs),
+                ban_band_prob=cfg.ban_band_prob,
+                ban_bond_ids=cfg.ban_bond_groups,
+                ban_bond_prob=cfg.ban_bond_group_prob,
                 max_prep_steps_per_round=cfg.max_prep_steps_per_round,
                 sampling_temperature=sampling_temperature,
                 min_batch=min_batch if min_batch > 0 else None,
@@ -400,6 +427,20 @@ def collect_ppo_rollouts(
         ep_prep_steps: dict[int, int] = {}
         ep_seen_sigs: dict[int, dict[tuple[Any, ...], int]] = {}
         ep_timeout_penalized: dict[int, bool] = {}
+        ep_ban_bands: dict[int, frozenset[int]] = {}
+        ep_ban_bonds: dict[int, frozenset[str]] = {}
+
+        def _sample_ep_bans(ep_idx: int) -> tuple[frozenset[int], frozenset[str]]:
+            if not ((ban_band_idxs and cfg.ban_band_prob > 0.0) or (cfg.ban_bond_groups and cfg.ban_bond_group_prob > 0.0)):
+                return frozenset(), frozenset()
+            ep_rng = random.Random(((seed_start + ep_idx) ^ 0x51A7BEEF) + ep_idx * 131)
+            b_bands = frozenset(ban_band_idxs) if (ban_band_idxs and ep_rng.random() < cfg.ban_band_prob) else frozenset()
+            b_bonds = (
+                frozenset(cfg.ban_bond_groups)
+                if (cfg.ban_bond_groups and ep_rng.random() < cfg.ban_bond_group_prob)
+                else frozenset()
+            )
+            return b_bands, b_bonds
 
         def _spawn_cmd(ep_idx: int) -> dict[str, Any]:
             cmd: dict[str, Any] = {
@@ -424,6 +465,7 @@ def collect_ppo_rollouts(
             ep_prep_steps[w] = 0
             ep_seen_sigs[w] = {}
             ep_timeout_penalized[w] = False
+            ep_ban_bands[w], ep_ban_bonds[w] = _sample_ep_bans(next_ep)
             next_ep += 1
         active_frames = sync_pool.exchange(init_cmds)
 
@@ -476,6 +518,23 @@ def collect_ppo_rollouts(
                             repeat_states += 1
                             if cfg.repeat_state_penalty != 0.0:
                                 ep_buf[w][-1].reward += cfg.repeat_state_penalty
+                    if ep_ban_bands[w] or ep_ban_bonds[w]:
+                        spec = enc.action_tree.to_mask_spec()
+                        masked = mask_opening_diversity(
+                            frame,
+                            spec,
+                            ban_band_idxs=ep_ban_bands[w],
+                            ban_bond_ids=ep_ban_bonds[w],
+                        )
+                        if masked is not spec:
+                            new_tm = torch.tensor(list(masked.type_mask_bytes), dtype=torch.bool)
+                            new_tree = replace(
+                                enc.action_tree,
+                                type_mask=new_tm,
+                                src_keys=masked.src_keys,
+                                _type_mask_bytes=masked.type_mask_bytes,
+                            )
+                            enc = replace(enc, action_tree=new_tree)
                     batch_workers.append(w)
                     batch_frames.append(frame)
                     batch_encs.append(enc)
@@ -547,6 +606,7 @@ def collect_ppo_rollouts(
                     ep_timeout_penalized[w] = False
                     if next_ep < num_episodes:
                         reset_cmds[w] = _spawn_cmd(next_ep)
+                        ep_ban_bands[w], ep_ban_bonds[w] = _sample_ep_bans(next_ep)
                         next_ep += 1
                 else:
                     next_active[w] = rep
@@ -629,6 +689,8 @@ def ppo_update(
     sum_explore_ent = 0.0
     sum_strat_ent = 0.0
     n_strat_batches = 0
+    sum_open_ent = 0.0
+    n_open_batches = 0
     sum_kl_bc = 0.0
     sum_approx_kl = 0.0
     sum_clip = 0.0
@@ -663,10 +725,18 @@ def ppo_update(
                     + float(c.opt_ent_weight) * out["opt_ent"]
                 )
                 is_strat = mb.get("is_strategic")
+                strat_ent_bonus = torch.zeros((), device=device)
+                open_mask = (mb["a_type"] == TYPE_BAND) | (mb["a_type"] == TYPE_BOND_GROUP)
+                if open_mask.any():
+                    sum_open_ent += float(ent_vec[open_mask].mean().item())
+                    n_open_batches += 1
                 if is_strat is not None:
                     if is_strat.any():
-                        sum_strat_ent += float(ent_vec[is_strat].mean().item())
+                        strat_ent_mean = ent_vec[is_strat].mean()
+                        sum_strat_ent += float(strat_ent_mean.item())
                         n_strat_batches += 1
+                        if c.strategic_ent_coef > 0.0:
+                            strat_ent_bonus = strat_ent_mean
                     # Keep full entropy on macro-strategic decisions (band/bond/SP/choice) scaled by
                     # strategic_ent_mult, while down-weighting PREP src/tgt/opt to prevent 36x4 MOVE hacking.
                     explore_ent_vec = torch.where(
@@ -697,7 +767,13 @@ def ppo_update(
                     )
                     approx_kl = 0.5 * (log_ratio ** 2).mean()
                     clip_frac = ((ratio - 1.0).abs() > c.clip_eps).float().mean()
-                    loss = policy_loss + c.vf_coef * value_loss - c.ent_coef * weighted_entropy + c.kl_coef * kl_bc
+                    loss = (
+                        policy_loss
+                        + c.vf_coef * value_loss
+                        - c.ent_coef * weighted_entropy
+                        - c.strategic_ent_coef * strat_ent_bonus
+                        + c.kl_coef * kl_bc
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -732,6 +808,7 @@ def ppo_update(
         "entropy": sum_ent / denom,
         "explore_entropy": sum_explore_ent / denom,
         "strategic_entropy": sum_strat_ent / max(1, n_strat_batches),
+        "opening_entropy": sum_open_ent / max(1, n_open_batches),
         "kl_to_bc": sum_kl_bc / denom,
         "approx_kl": sum_approx_kl / denom,
         "clip_frac": sum_clip / denom,
@@ -764,6 +841,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--ent-coef", type=float, default=0.01, help="Initial entropy bonus coefficient")
     parser.add_argument("--ent-coef-end", type=float, default=-1.0, help="Optional final entropy coef for linear annealing (<0 disables)")
     parser.add_argument("--strategic-ent-mult", type=float, default=1.0, help="Entropy multiplier on macro-strategic decisions")
+    parser.add_argument("--strategic-ent-coef", type=float, default=0.0, help="Decoupled entropy bonus coef over strategic transitions only")
+    parser.add_argument("--strategic-ent-coef-end", type=float, default=-1.0, help="Optional final strategic_ent_coef for linear annealing (<0 disables)")
+    parser.add_argument("--ban-bands", type=str, default="", help="Comma-separated opening bandIds to mask probabilistically during training (e.g. 'band_cannot')")
+    parser.add_argument("--ban-band-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bands during training rollouts")
+    parser.add_argument("--ban-bond-groups", type=str, default="", help="Comma-separated core bondIds whose INFO_CHECK group is masked probabilistically (e.g. 'lethaniaShip')")
+    parser.add_argument("--ban-bond-group-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bond-groups during training rollouts")
     parser.add_argument("--src-ent-weight", type=float, default=0.5, help="Non-strategic step-2 source-pointer entropy weight")
     parser.add_argument("--tgt-ent-weight", type=float, default=0.15, help="Non-strategic step-3 target-tile pointer entropy weight")
     parser.add_argument("--opt-ent-weight", type=float, default=0.15, help="Non-strategic step-4 facing/replace-slot entropy weight")
@@ -804,11 +887,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     eval_modes = parse_solo_modes(args.eval_modes) if args.eval_modes else modes
     mix_modes = parse_solo_modes(args.mix_modes) if args.mix_modes else ()
     boss_weights = parse_boss_weights(args.boss_weights)
+    ban_bands = parse_id_list(args.ban_bands)
+    ban_bond_groups = parse_id_list(args.ban_bond_groups)
     device = resolve_device(args.device)
     print(
         f"Using device: {describe_device(device)} | modes={modes}"
         + (f" | mix={mix_modes} ({args.mix_ratio_start:.2f}->{args.mix_ratio_end:.2f})" if mix_modes else "")
-        + (f" | boss_weights={boss_weights}" if boss_weights else ""),
+        + (f" | boss_weights={boss_weights}" if boss_weights else "")
+        + (f" | ban_bands={ban_bands}@{args.ban_band_prob:.2f}" if (ban_bands and args.ban_band_prob > 0.0) else "")
+        + (f" | ban_bonds={ban_bond_groups}@{args.ban_bond_group_prob:.2f}" if (ban_bond_groups and args.ban_bond_group_prob > 0.0) else ""),
         flush=True,
     )
 
@@ -855,6 +942,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ppo_epochs=args.ppo_epochs,
         ent_coef=args.ent_coef,
         strategic_ent_mult=args.strategic_ent_mult,
+        strategic_ent_coef=args.strategic_ent_coef,
         src_ent_weight=args.src_ent_weight,
         tgt_ent_weight=args.tgt_ent_weight,
         opt_ent_weight=args.opt_ent_weight,
@@ -870,6 +958,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         defeat_reward=args.defeat_reward,
         hidden_clear_bonus=args.hidden_clear_bonus,
         boss_dmg_defeat_bonus=args.boss_dmg_defeat_bonus,
+        ban_bands=ban_bands,
+        ban_band_prob=args.ban_band_prob,
+        ban_bond_groups=ban_bond_groups,
+        ban_bond_group_prob=args.ban_bond_group_prob,
     )
     critic_opt = torch.optim.AdamW(model.value_head.parameters(), lr=ppo_cfg.critic_lr, weight_decay=1e-4)
     full_opt = torch.optim.AdamW(model.parameters(), lr=ppo_cfg.lr, weight_decay=1e-4)
@@ -933,6 +1025,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cur_mix = args.mix_ratio_start
                 cur_lr = args.lr
                 cur_ent = args.ent_coef
+                cur_strat_ent = args.strategic_ent_coef
                 cur_kl = args.kl_coef if ref_model is not None else 0.0
             else:
                 rl_step = upd - warmup - 1
@@ -941,6 +1034,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cur_mix = _schedule_linear(args.mix_ratio_start, args.mix_ratio_end, mix_prog)
                 cur_lr = _schedule_cosine(args.lr, args.lr_end, prog) if args.lr_end >= 0.0 else args.lr
                 cur_ent = _schedule_linear(args.ent_coef, args.ent_coef_end, prog) if args.ent_coef_end >= 0.0 else args.ent_coef
+                cur_strat_ent = (
+                    _schedule_linear(args.strategic_ent_coef, args.strategic_ent_coef_end, prog)
+                    if args.strategic_ent_coef_end >= 0.0
+                    else args.strategic_ent_coef
+                )
                 if ref_model is not None:
                     kl_prog = min(1.0, rl_step / max(1, args.kl_anneal_updates)) if args.kl_anneal_updates > 0 else prog
                     cur_kl = _schedule_linear(args.kl_coef, args.kl_coef_end, kl_prog) if args.kl_coef_end >= 0.0 else args.kl_coef
@@ -949,6 +1047,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for pg in full_opt.param_groups:
                     pg["lr"] = cur_lr
                 ppo_cfg.ent_coef = cur_ent
+                ppo_cfg.strategic_ent_coef = cur_strat_ent
                 ppo_cfg.kl_coef = cur_kl
 
             ep_modes = build_curriculum_episode_modes(
@@ -1009,7 +1108,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             sched_info = ""
             if mix_modes or args.ent_coef_end >= 0.0 or args.kl_coef_end >= 0.0 or args.lr_end >= 0.0:
                 sched_info = f" [lr={cur_lr:.1e} ent_c={cur_ent:.4f} kl_c={cur_kl:.4f}" + (f" mix={cur_mix:.2f}]" if mix_modes else "]")
-            strat_info = f" s_ent={u_stats['strategic_entropy']:.2f}" if u_stats.get("strategic_entropy", 0.0) > 0.0 else ""
+            strat_info = (
+                f" s_ent={u_stats['strategic_entropy']:.2f} o_ent={u_stats['opening_entropy']:.2f}"
+                if u_stats.get("strategic_entropy", 0.0) > 0.0
+                else ""
+            )
             print(
                 f"[{tag}] "
                 f"win={r_stats['win_rate']*100:.1f}%{hid_info} rounds={r_stats['avg_rounds_passed']:.2f} "
