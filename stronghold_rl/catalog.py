@@ -130,10 +130,23 @@ def _build_stage_spatial_grid(stage: dict[str, Any], boss_left: bool = False) ->
     for route_key, pts in paths.items():
         if not isinstance(pts, list) or not pts:
             continue
-        start_r = pts[0][0] if isinstance(pts[0], list) and len(pts[0]) >= 2 else -1
+        start_pt = pts[0]
+        end_pt = pts[-1]
+        if not (
+            isinstance(start_pt, list)
+            and len(start_pt) >= 2
+            and isinstance(end_pt, list)
+            and len(end_pt) >= 2
+        ):
+            continue
+        start_r, start_c = start_pt[0], start_pt[1]
+        end_c = end_pt[1]
         # Filter routes matching normal field (rows 9..12) vs boss field (rows <= 5)
         is_boss_route = start_r <= 8
         if is_boss_route != boss_left:
+            continue
+        # Exclude 联防 cross-field routes (start_c=18) and right-half boss routes (end_c=17..18)
+        if start_c > FIELD_C1 or end_c > FIELD_C1:
             continue
         # Gate classification matches shared/constants.js gateOf()
         target_r = start_r + (13 if boss_left else 6)
@@ -381,12 +394,23 @@ def get_catalog(data_dir: Path | None = None) -> GameCatalog:
     for eff_id in sorted(effects_raw.keys()):
         _register(eff_id)
     for b in bands_raw.values():
+        _register(b.get("effectId"))
+        _register(b.get("iconId"))
         for sk in b.get("skills") or []:
             _register(sk.get("effectId"))
+    for bd in bonds_raw.values():
+        _register(bd.get("effectId"))
+        _register(bd.get("iconId"))
+    for iid in sorted(items_raw.keys()):
+        it = items_raw[iid]
+        _register(it.get("effectId"))
+        _register(it.get("iconId"))
+        _register(it.get("trapId"))
+    _register("bounty")
 
     def _walk_choices(obj: Any) -> None:
         if isinstance(obj, dict):
-            for k in ("id", "cardId", "effectId", "choiceId", "buffId"):
+            for k in ("id", "cardId", "effectId", "choiceId", "buffId", "iconId"):
                 v = obj.get(k)
                 if isinstance(v, str) and v:
                     _register(v)
