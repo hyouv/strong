@@ -42,6 +42,7 @@ class PPOConfig:
     gamma_intra: float | None = None  # if set (e.g. 1.0), discount by gamma_intra within a round and gamma_round across combat boundaries
     gamma_round: float = 0.97
     gae_lambda: float = 0.95
+    gae_lambda_intra: float | None = None  # if set (e.g. 1.0), apply gae_lambda only at round boundaries so long PREP phases don't decay credit
     clip_eps: float = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.01
@@ -193,12 +194,17 @@ def _finalize_ppo_batch(
             done = bool(tr["done"])
             next_val = 0.0 if (i == len(ep) - 1 or done) else float(ep[i + 1]["value"])
             non_term = 0.0 if done else 1.0
+            is_round_end = bool(tr.get("round_end"))
             if cfg.gamma_intra is not None:
-                step_gamma = cfg.gamma_round if bool(tr.get("round_end")) else cfg.gamma_intra
+                step_gamma = cfg.gamma_round if is_round_end else cfg.gamma_intra
             else:
                 step_gamma = cfg.gamma
+            if cfg.gae_lambda_intra is not None:
+                step_lambda = cfg.gae_lambda if is_round_end else cfg.gae_lambda_intra
+            else:
+                step_lambda = cfg.gae_lambda
             delta = float(tr["reward"]) + step_gamma * next_val * non_term - float(tr["value"])
-            gae = delta + step_gamma * cfg.gae_lambda * non_term * gae
+            gae = delta + step_gamma * step_lambda * non_term * gae
             ep_adv[i] = gae
             ep_ret[i] = gae + float(tr["value"])
         flat.extend(ep)
@@ -696,6 +702,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--round-discount", action="store_true", help="Use intra-round gamma_intra=1.0 and cross-round gamma_round")
     parser.add_argument("--gamma-intra", type=float, default=-1.0, help="Override intra-round gamma (>=0 enables round-boundary discounting)")
     parser.add_argument("--gamma-round", type=float, default=0.97, help="Cross-round discount factor at combat boundaries")
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda (applied at round boundaries when round discounting is active)")
+    parser.add_argument("--gae-lambda-intra", type=float, default=-1.0, help="Override intra-round GAE lambda (<0 defaults to 1.0 with --round-discount)")
     parser.add_argument("--step-penalty", type=float, default=-0.0005, help="Per-PREP-step penalty")
     parser.add_argument("--prep-timeout-penalty", type=float, default=0.0, help="Extra penalty once per round on PREP step cap timeout")
     parser.add_argument("--repeat-state-penalty", type=float, default=0.0, help="Extra penalty when a PREP action returns to a visited state")
@@ -750,11 +758,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.round_discount:
         gamma_intra = 1.0
 
+    gae_lambda_intra: float | None = None
+    if args.gae_lambda_intra >= 0.0:
+        gae_lambda_intra = float(args.gae_lambda_intra)
+    elif gamma_intra is not None:
+        gae_lambda_intra = 1.0
+
     warmup = args.critic_warmup if args.init_ckpt else 0
     ppo_cfg = PPOConfig(
         gamma=args.gamma,
         gamma_intra=gamma_intra,
         gamma_round=args.gamma_round,
+        gae_lambda=args.gae_lambda,
+        gae_lambda_intra=gae_lambda_intra,
         lr=args.lr,
         critic_lr=args.critic_lr,
         critic_warmup_updates=warmup,

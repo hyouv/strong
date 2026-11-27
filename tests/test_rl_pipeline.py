@@ -579,3 +579,54 @@ def test_prep_timeout_and_repeat_state_penalties() -> None:
     assert stats_sync["episodes"] == 1
     assert "repeat_states" in stats_sync and stats_sync["repeat_states"] >= 0
     assert torch.isfinite(batch_sync["returns"]).all()
+
+
+def test_round_boundary_gae_lambda_preserves_intra_round_credit() -> None:
+    """With gae_lambda_intra=1.0, long intra-round PREP chains suffer zero lambda decay across steps."""
+    dummy_t = lambda r, v, done, rnd_end: {
+        "cat_ids": torch.zeros((NUM_TOKENS, NUM_CAT_FIELDS), dtype=torch.long),
+        "cont_feats": torch.zeros((NUM_TOKENS, CONT_DIM), dtype=torch.float32),
+        "valid_mask": torch.ones(NUM_TOKENS, dtype=torch.bool),
+        "a_type": 0,
+        "a_src": -1,
+        "a_tgt": -1,
+        "a_opt": -1,
+        "type_mask": torch.ones(19, dtype=torch.bool),
+        "src_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
+        "has_src": False,
+        "band_mask": torch.zeros(61, dtype=torch.bool),
+        "has_band": False,
+        "tgt_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
+        "has_tgt": False,
+        "opt_mask": torch.zeros(4, dtype=torch.bool),
+        "has_opt": False,
+        "is_strategic": False,
+        "old_log_prob": -0.5,
+        "value": v,
+        "reward": r,
+        "done": done,
+        "round_end": rnd_end,
+    }
+    # 20 intra-round steps in round 1 (v=0.2), 1 round-end transition, 20 intra-round steps in round 2 (v=0.2), terminal +1.5
+    ep = (
+        [dummy_t(0.0, 0.2, False, False) for _ in range(20)]
+        + [dummy_t(0.0, 0.2, False, True)]
+        + [dummy_t(0.0, 0.2, False, False) for _ in range(20)]
+        + [dummy_t(1.5, 0.2, True, False)]
+    )
+    cfg_fixed = PPOConfig(gamma_intra=1.0, gamma_round=0.97, gae_lambda=0.95, gae_lambda_intra=1.0, kl_coef=0.0)
+    b_fixed, _ = _finalize_ppo_batch([ep], cfg=cfg_fixed, ref_model=None, device="cpu")
+
+    # Round 2 steps: no intra-round discount or lambda decay -> exact return 1.5 for every step in round 2
+    assert abs(float(b_fixed["returns"][-1]) - 1.5) < 1e-5
+    assert abs(float(b_fixed["returns"][21]) - 1.5) < 1e-5
+    # Round 1 boundary step (idx 20): delta = 0.97*0.2 - 0.2 = -0.006, gae_next = 1.3 -> ret = 0.2 + delta + 0.97*0.95*1.3
+    expected_r1 = 0.97 * (0.2 + 0.95 * (1.5 - 0.2))
+    assert abs(float(b_fixed["returns"][20]) - expected_r1) < 1e-5
+    # Step 0 (20 PREP steps earlier in round 1) gets IDENTICAL return (zero intra-round decay!)
+    assert abs(float(b_fixed["returns"][0]) - expected_r1) < 1e-5
+
+    # Contrast with legacy per-step lambda=0.95: credit at step 0 decays severely toward Critic value 0.2
+    cfg_legacy = PPOConfig(gamma_intra=1.0, gamma_round=0.97, gae_lambda=0.95, gae_lambda_intra=None, kl_coef=0.0)
+    b_legacy, _ = _finalize_ppo_batch([ep], cfg=cfg_legacy, ref_model=None, device="cpu")
+    assert float(b_fixed["returns"][0]) > float(b_legacy["returns"][0]) + 0.8
