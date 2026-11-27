@@ -25,6 +25,7 @@ from stronghold_sim import RoomPool, SOLO_TIER1_MODES, parse_solo_modes
 
 from .catalog import GameCatalog, get_catalog
 from .bc_openings import BalancedOpeningSampler, bc_cache_metadata
+from .bc_collection import DEFAULT_EPISODE_RETRIES, ExpertReplayCollector
 from .codec import (
     NO_ARG,
     TEMP_OFFSET,
@@ -303,6 +304,8 @@ def collect_solo_expert_dataset(
     verbose: bool = False,
     catalog: GameCatalog | None = None,
     opening_policy: str = "balanced",
+    max_episode_retries: int = DEFAULT_EPISODE_RETRIES,
+    quarantine_path: str | Path | None = None,
 ) -> tuple[BCDataset, dict[str, Any]]:
     """Generate solo expert replays in parallel via RoomPool and encode them across CPU processes."""
     _ = catalog if catalog is not None else get_catalog()
@@ -313,6 +316,10 @@ def collect_solo_expert_dataset(
     if opening_policy == "balanced" and only_victories:
         raise ValueError("Filtering victories would bias balanced opening coverage")
     opening_sampler = BalancedOpeningSampler(seed_start) if opening_policy == "balanced" else None
+    replay_collector = ExpertReplayCollector(
+        seed_start=seed_start, num_episodes=num_episodes, max_retries=max_episode_retries,
+        quarantine_path=quarantine_path,
+    )
     t0 = time.perf_counter()
 
     n_sim = max(1, min(num_workers, num_episodes))
@@ -352,7 +359,7 @@ def collect_solo_expert_dataset(
                     } for w, cmd in cmds.items()})
                     for w, cmd in cmds.items():
                         cmd["opening"] = opening_sampler.choose(options[w]["options"], cmd["modeId"])
-                replies = pool.exchange(cmds)
+                replies = replay_collector.exchange(pool, cmds)
                 ep += batch_n
 
                 payloads: list[tuple[bytes, float]] = []
@@ -393,7 +400,7 @@ def collect_solo_expert_dataset(
     fields = tuple(chunks[0].keys())
     merged = {k: torch.cat([c[k] for c in chunks], dim=0) for k in fields}
     dataset = BCDataset(**merged)
-    dataset._metadata = bc_cache_metadata(opening_policy, modes, num_episodes, seed_start)
+    dataset._metadata = bc_cache_metadata(opening_policy, modes, num_episodes, seed_start, max_episode_retries)
     stats = {
         "episodes_total": total_episodes,
         "episodes_kept": kept_episodes,
@@ -402,8 +409,13 @@ def collect_solo_expert_dataset(
         "elapsed_sec": round(time.perf_counter() - t0, 2),
         "opening_policy": dataset._metadata["opening_policy"],
         "opening_coverage": opening_sampler.summary() if opening_sampler is not None else None,
+        "episodes_quarantined": len(replay_collector.failures),
+        "episodes_replaced": len(replay_collector.replacements),
+        "quarantine_log": str(replay_collector.quarantine_path) if replay_collector.quarantine_path else None,
     }
     dataset._metadata["opening_coverage"] = stats["opening_coverage"]
+    dataset._metadata["quarantined_episodes"] = replay_collector.failures
+    dataset._metadata["replacement_episodes"] = replay_collector.replacements
     return dataset, stats
 
 
@@ -931,6 +943,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dataset-cache", type=str, default="", help="Optional .pt path to save/load dataset")
     parser.add_argument("--opening-policy", choices=("balanced", "legacy"), default="balanced",
                         help="Balanced compatible opening coverage (default), or original expert choices")
+    parser.add_argument("--max-episode-retries", type=int, default=DEFAULT_EPISODE_RETRIES,
+                        help="Replacement attempts for an invalid expert match; keeps its opening and difficulty")
+    parser.add_argument("--quarantine-log", default="", help="Failed-match JSONL (default: next to dataset cache)")
     parser.add_argument("--eval-episodes", type=int, default=8)
     parser.add_argument("--eval-workers", type=int, default=0, help="Parallel eval workers (0 = match --workers)")
     parser.add_argument("--eval-seed-start", type=int, default=9000)
@@ -965,7 +980,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     cache_path = Path(args.dataset_cache) if args.dataset_cache else None
-    expected_cache = bc_cache_metadata(args.opening_policy, modes, args.episodes, args.seed)
+    expected_cache = bc_cache_metadata(args.opening_policy, modes, args.episodes, args.seed, args.max_episode_retries)
     if cache_path and cache_path.is_file():
         dataset = BCDataset.load(cache_path, expected_metadata=expected_cache if args.opening_policy == "balanced" else None)
         print(f"Loaded cached dataset: {len(dataset)} transitions from {cache_path}", flush=True)
@@ -981,6 +996,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             verbose=True,
             catalog=cat,
             opening_policy=args.opening_policy,
+            max_episode_retries=args.max_episode_retries,
+            quarantine_path=args.quarantine_log or (
+                str(cache_path) + ".quarantine.jsonl" if cache_path else f"logs/bc_quarantine_{args.seed}.jsonl"
+            ),
         )
         print("Expert dataset collected:", json.dumps(stats, ensure_ascii=False), flush=True)
         if cache_path:

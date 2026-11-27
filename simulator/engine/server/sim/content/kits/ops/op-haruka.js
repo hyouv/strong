@@ -216,13 +216,21 @@ export default {
           if (unit.skill?.id !== S2) return;
           const scale = num(b2.atk_scale_extra), n = Math.max(0, Math.floor(num(b2.max_target_extra)));
           const r = num(b2.ability_range_radius, S2_RADIUS);
+          // A damage-to-heal rider (e.g. 汲取者之喙) can synchronously heal her from this splash.
+          // Keep that heal, but do not let this same splash trigger itself recursively.
+          let resolving = false;
           battle.on('heal', (c) => {
-            if (c.source !== unit || c.opts?.regen || !skillOn(unit, S2) || !(c.amount > 0) || !(scale > 0) || !n) return;
+            if (resolving || c.source !== unit || c.opts?.regen || !skillOn(unit, S2) || !(c.amount > 0) || !(scale > 0) || !n) return;
             const t = c.target;
             const foes = battle.foesInRadius(t.x, t.y, r);
             foes.sort((x, y) => hypot(x.x - t.x, x.y - t.y) - hypot(y.x - t.x, y.y - t.y) || x.spawnSeq - y.spawnSeq);
             const amount = c.amount * scale;
-            for (const e of foes.slice(0, n)) battle.dealDamage(unit, e, { amount, type: 'arts', isSkill: true, tags: ['skill', 'haruka:s2'] });
+            resolving = true;
+            try {
+              for (const e of foes.slice(0, n)) battle.dealDamage(unit, e, { amount, type: 'arts', isSkill: true, tags: ['skill', 'haruka:s2'] });
+            } finally {
+              resolving = false;
+            }
             if (foes.length) battle.fx('aoe', { x: t.x, y: t.y, radius: r, id: unit.id, skill: 'haruka:s2' });
           }, { owner: unit, priority: -1000 });
         } },

@@ -42,7 +42,7 @@ NORMAL 读取本次 BC，HARD 读取本次 NORMAL best，ABYSS 读取本次 HARD
 默认 `BC_OPENING_POLICY=balanced`、`BC_EPOCHS=10`，数据缓存改为：
 
 ```text
-data/v2feat_solo_1_8_1200ep_balanced_v1.pt
+data/v2feat_solo_1_8_1200ep_balanced_v2.pt
 ```
 
 采集器先查询每个种子的合法策略及其兼容盟约组，再优先补足出现次数较少的策略、
@@ -57,6 +57,14 @@ data/v2feat_solo_1_8_1200ep_balanced_v1.pt
 
 缓存记录生成策略版本、等级、局数、种子和开局分布，加载均衡数据时校验这些配置。
 配置不匹配时使用新的 `BC_DATASET_CACHE` 路径重新采集；不能把旧缓存改名当作均衡缓存。
+
+v2 修复了遥二技能与吸血效果在同一次结算内递归触发的问题，并加入异常局隔离补采。
+模拟器判为 `Invalid expert match` 的整局会丢弃，原始种子、开局和完整错误立即写入
+`<缓存路径>.quarantine.jsonl`；成功的同批对局保留。最多换种子补采 3 次，难度、策略和
+盟约组索引不变，新种子先检查开局兼容性（具体盟约内容随种子变化）。耗尽重试或发生
+进程/协议错误时仍报错退出。
+缓存元数据保存失败与替换种子；日志输出 `episodes_quarantined` 和 `episodes_replaced`。
+这是对异常样本的容错，补采会排除出错局面，不能替代修复模拟器及检查异常比例。
 
 ## 从现有最佳权重渐进续训
 

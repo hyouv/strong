@@ -122,7 +122,7 @@ BC_LABEL_SMOOTHING="${BC_LABEL_SMOOTHING:-0.10}"  # softer opening logits preven
 BC_VAL_RATIO="${BC_VAL_RATIO:-0.1}"
 BC_SEED="${BC_SEED:-100000}"
 BC_OPENING_POLICY="${BC_OPENING_POLICY:-balanced}"
-BC_DATASET_CACHE="${BC_DATASET_CACHE:-data/v2feat_solo_1_8_${BC_EPISODES}ep_${BC_OPENING_POLICY}_v1.pt}"
+BC_DATASET_CACHE="${BC_DATASET_CACHE:-data/v2feat_solo_1_8_${BC_EPISODES}ep_${BC_OPENING_POLICY}_v2.pt}"
 BC_CKPT="${BC_CKPT:-checkpoints/v2feat_bc_5m_solo_1_8_${BC_EPISODES}ep.pt}"
 
 # ---- Stage 2: NORMAL Curriculum PPO (mode_single_5..8 + L1..4 replay) ------------------------------

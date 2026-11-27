@@ -5,6 +5,8 @@ from collections import Counter
 import random
 from typing import Any, Mapping, Sequence
 
+from .bc_collection import DEFAULT_EPISODE_RETRIES
+
 
 BALANCED_OPENING_VERSION = "balanced-v1"
 
@@ -45,9 +47,12 @@ class BalancedOpeningSampler:
         }
 
 
-def bc_cache_metadata(opening_policy: str, modes: Sequence[str], episodes: int, seed: int) -> dict[str, Any]:
+def bc_cache_metadata(opening_policy: str, modes: Sequence[str], episodes: int, seed: int,
+                      max_episode_retries: int = DEFAULT_EPISODE_RETRIES) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "generation_version": "haruka-reentry-fix-quarantine-v1",
         "opening_policy": BALANCED_OPENING_VERSION if opening_policy == "balanced" else "legacy",
         "modes": list(modes), "episodes": episodes, "seed": seed,
+        "max_episode_retries": max_episode_retries,
     }
