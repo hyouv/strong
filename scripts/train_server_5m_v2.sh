@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-End 5.08M Solo Training Pipeline (Zero-Arch Feature Set v2, Anti-Collapse Curriculum)
 #
-# Trains from scratch on the enriched zero-arch observation features (114 tokens x 8 cat x 28 cont):
+# Trains from scratch on the enriched observation features (121 tokens x 12 cat x 28 cont, 6 sub-opts):
 #   Stage 1 (bc):     Unified BC cold-start on mode_single_1..8 (ALL 10 maps, ALL 26 bonds / 10 core bonds,
 #                     ALL 61 bands, R15 Hidden Core). Soft label-smoothing (0.10) + dropout (0.12) keep
 #                     opening logits smooth and diverse before RL starts.
@@ -219,22 +219,22 @@ preflight() {
 import torch
 from stronghold_sim.runtime import find_node
 from stronghold_rl.catalog import get_catalog
-from stronghold_rl.codec import NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM
+from stronghold_rl.codec import NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM, NUM_SUB_OPTS
 from stronghold_rl.model import PolicyConfig, StrongholdPolicyNet
 
 assert torch.cuda.is_available(), 'CUDA unavailable'
 dev = torch.device('${DEVICE}')
 idx = 0 if dev.index is None else dev.index
 cat = get_catalog()
-assert hasattr(cat, 'boss_pool_hp') and hasattr(cat, 'enemy_scale'), 'Missing v2 zero-arch catalog tables!'
-assert (NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM) == (114, 8, 28), f'Unexpected token shape: {(NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM)}'
+assert hasattr(cat, 'boss_pool_hp') and hasattr(cat, 'enemy_scale'), 'Missing v2 catalog tables!'
+assert (NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM, NUM_SUB_OPTS) == (121, 12, 28, 6), f'Unexpected token shape: {(NUM_TOKENS, NUM_CAT_FIELDS, CONT_DIM, NUM_SUB_OPTS)}'
 cfg = PolicyConfig(d_model=${D_MODEL}, n_heads=${N_HEADS}, n_layers=${N_LAYERS}, dim_ff=${DIM_FF}, dropout=${DROPOUT})
 m = StrongholdPolicyNet(catalog=cat, config=cfg)
 n = sum(p.numel() for p in m.parameters())
 print('Node.js:', find_node())
 print('PyTorch:', torch.__version__, '| GPU:', idx, torch.cuda.get_device_name(idx))
 print(f'Catalog v2 OK: entities={cat.num_entities}, items={cat.num_items}, enemies={len(cat.enemy_meta)}, bosses={len(cat.boss_meta)}, core_bonds={len(cat.core_bond_indices)}')
-print(f'Parameter count: {n:,} ({n/1e6:.2f}M) | obs=({NUM_TOKENS}, {NUM_CAT_FIELDS}, {CONT_DIM})')
+print(f'Parameter count: {n:,} ({n/1e6:.2f}M) | obs=({NUM_TOKENS}, {NUM_CAT_FIELDS}, {CONT_DIM}) | sub_opts={NUM_SUB_OPTS}')
 "
 }
 

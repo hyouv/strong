@@ -36,6 +36,7 @@ from stronghold_rl.codec import (
     EFFECT_OFFSET,
     MATCH_STAGE_IDX,
     NUM_CAT_FIELDS,
+    NUM_SUB_OPTS,
     NUM_TOKENS,
     encode_frame,
     encode_frame_into,
@@ -354,7 +355,7 @@ def test_curriculum_modes_round_discount_and_tier2_codec() -> None:
         "has_band": False,
         "tgt_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
         "has_tgt": False,
-        "opt_mask": torch.zeros(4, dtype=torch.bool),
+        "opt_mask": torch.zeros(NUM_SUB_OPTS, dtype=torch.bool),
         "has_opt": False,
         "is_strategic": False,
         "old_log_prob": -0.5,
@@ -600,7 +601,7 @@ def test_round_boundary_gae_lambda_preserves_intra_round_credit() -> None:
         "has_band": False,
         "tgt_mask": torch.zeros(NUM_TOKENS, dtype=torch.bool),
         "has_tgt": False,
-        "opt_mask": torch.zeros(4, dtype=torch.bool),
+        "opt_mask": torch.zeros(NUM_SUB_OPTS, dtype=torch.bool),
         "has_opt": False,
         "is_strategic": False,
         "old_log_prob": -0.5,
@@ -774,36 +775,60 @@ def test_decoupled_strategic_entropy_and_opening_diversity_masking() -> None:
 
 
 def test_zero_arch_observation_features_and_shape_invariance() -> None:
-    """Zero-arch feature enrichments must preserve (114, 8, 28) shapes and populate all new tactical/macro cues."""
+    """Enriched observation codec must preserve (121, 12, 28, 6-opt) shapes and populate all tactical/macro cues."""
     from stronghold_rl.codec import (
         BOND_OFFSET,
+        CAT_EQUIP5,
         CHOICE_OFFSET,
+        CMD_CHOICE_OFFSET,
         ENEMY_OFFSET,
         HAND_OFFSET,
         REWARD_OFFSET,
         SHOP_OFFSET,
+        TYPE_CHOICE,
+        TYPE_COMMAND_CHOICE,
+        TYPE_EQUIP,
+        TYPE_REWARD,
     )
 
     cat = get_catalog()
-    assert NUM_TOKENS == 114
-    assert NUM_CAT_FIELDS == 8
+    assert NUM_TOKENS == 121
+    assert NUM_CAT_FIELDS == 12
     assert CONT_DIM == 28
+    assert NUM_SUB_OPTS == 6
+
+    # 0. All 10 main maps (m01..m06, m09..m12) must exclude cross-field 联防 / right-half boss routes
+    main_maps = [sid for sid in cat.stage_normal_spatial if sid.split("_")[-1].startswith("m") and sid[-1].isdigit()]
+    assert len(main_maps) >= 10
+    for sid in main_maps:
+        grid = cat.stage_normal_spatial[sid]
+        progs = [sp.path_progress for sp in grid if sp.is_ground_path]
+        assert progs and min(progs) == 0.0, f"{sid} path_progress polluted: min={min(progs) if progs else None}"
+        bgrid = cat.stage_boss_spatial[sid]
+        bprogs = [sp.path_progress for sp in bgrid if sp.is_ground_path]
+        assert bprogs and min(bprogs) < 0.25, f"{sid} boss path_progress polluted: min={min(bprogs) if bprogs else None}"
 
     # 1. INFO_CHECK bond-group choice cards must directly encode 10-dim core bond multi-hot in cols [6..15]
     with RoomClient() as rc:
         f_info = rc.reset(seed=51001, mode_id="mode_single_15", policy_version=0, compact=True, boss_id="boss_17")
     assert f_info["phase"] == "INFO_CHECK"
     enc_info = encode_frame(f_info, cat)
-    assert enc_info.cont_feats.shape == (114, 28)
+    assert enc_info.cont_feats.shape == (NUM_TOKENS, CONT_DIM)
     assert float(enc_info.cont_feats[CHOICE_OFFSET, 6:16].sum()) >= 1.0
     assert float(enc_info.cont_feats[CHOICE_OFFSET + 1, 6:16].sum()) >= 1.0
-    # Mode L15 vs L20 Boss HP pool must differ cleanly on BOSS token cols [5, 16]
+    assert abs(float(enc_info.cont_feats[CHOICE_OFFSET + 1, 18]) - (1.0 / 7.0)) < 1e-5
+    # Mode L15 vs L20 Boss HP pool must differ cleanly on BOSS token cols [5, 16]; L15 boss ATK must exceed L1 boss ATK
     f_l20 = copy.deepcopy(f_info)
     f_l20["pub"]["modeId"] = "mode_single_20"
     enc_l20 = encode_frame(f_l20, cat)
+    f_l1 = copy.deepcopy(f_info)
+    f_l1["pub"]["modeId"] = "mode_single_1"
+    f_l1["pub"]["hiddenRound"] = None
+    enc_l1 = encode_frame(f_l1, cat)
     assert float(enc_info.cont_feats[BOSS_IDX, 5]) > 0.5
     assert float(enc_l20.cont_feats[BOSS_IDX, 16]) > float(enc_info.cont_feats[BOSS_IDX, 16]) + 0.5
-    assert float(enc_info.cont_feats[BOSS_IDX, 6]) > 0.0  # boss ATK
+    assert float(enc_info.cont_feats[BOSS_IDX, 6]) > float(enc_l1.cont_feats[BOSS_IDX, 6])  # scaled boss ATK
+    assert float(enc_info.cont_feats[BOSS_IDX, 9]) > float(enc_l1.cont_feats[BOSS_IDX, 9])  # scaled boss speed
     assert float(enc_info.cont_feats[BOSS_IDX, 10]) > 0.0  # boss lpr
 
     # 2. Synthetic PREP frame exercising all new zero-arch feature slots
@@ -944,3 +969,88 @@ def test_zero_arch_observation_features_and_shape_invariance() -> None:
     assert float(cf[ENEMY_OFFSET, 8]) > 0.5
     assert abs(float(cf[ENEMY_OFFSET, 16]) - (1.0 / 3.0)) < 1e-5
     assert abs(float(cf[ENEMY_OFFSET, 17]) - 1.0) < 1e-5
+
+    # 3. Regression tests for 6-slot rewardOffer, coexisting personalChoice+commandDraft,
+    #    6-equip-slot operator replacement, bounty/doll iconId, soloShip inactive max-tier, no-hiddenRound guard.
+    six_items = list(cat.item_meta.keys())[:6]
+    reg_frame = copy.deepcopy(prep_frame)
+    reg_frame["pub"]["modeId"] = "mode_single_1"
+    reg_frame["pub"]["hiddenRound"] = None
+    reg_frame["own"]["shop"]["rewardOffer"] = {
+        "slots": [{"id": iid, "kind": "item", "sold": False, "price": 0} for iid in six_items]
+    }
+    reg_frame["own"]["personalChoice"] = {"cards": [{"id": six_items[0], "tier": 3}, {"id": six_items[1], "tier": 4}]}
+    reg_frame["own"]["commandDraft"] = {"cards": [{"effectId": "aceffect_band_10", "cost": 2}, {"effectId": "aceffect_band_99", "cost": 3}]}
+    reg_frame["own"]["effects"] = [
+        {"id": "bounty:5", "iconId": "enemyeffect_16_9", "iconKind": "choice", "counter": 2},
+        {"id": "doll:1", "iconId": "trap_1113_acarm113", "iconKind": "choice"},
+    ]
+    reg_frame["own"]["board"] = [
+        {
+            "uid": 301,
+            "kind": "chess",
+            "id": "chess_char_5_22_b",
+            "golden": True,
+            "tier": 5,
+            "count": 1,
+            "row": p_row,
+            "col": p_col,
+            "dir": "RIGHT",
+            "items": [{"uid": 400 + j, "id": six_items[j]} for j in range(6)],
+        }
+    ]
+    reg_frame["own"]["hand"] = [
+        {"uid": 501, "kind": "item", "id": sample_item_id, "golden": False, "tier": sample_im.tier, "count": 1}
+    ]
+    reg_frame["own"]["bonds"].append({"bondId": "soloShip", "active": False, "count": 2, "tier": 0, "layers": 0, "thresholds": [1]})
+    reg_frame["actions"] = [
+        {"t": "g.ready"},
+        *[{"t": "g.reward", "idx": j} for j in range(6)],
+        {"t": "g.choice", "idx": 0},
+        {"t": "g.choice", "idx": 1},
+        {"t": "g.commandChoice", "idx": 0},
+        {"t": "g.commandChoice", "idx": 1},
+        *[{"t": "g.equip", "itemUid": 501, "targetUid": 301, "replaceUid": 400 + j} for j in range(6)],
+    ]
+    enc_r = encode_frame(reg_frame, cat)
+    # 6-slot rewardOffer never collides with CHOICE_OFFSET
+    assert enc_r.action_tree.src_keys[TYPE_REWARD] == [REWARD_OFFSET + j for j in range(6)]
+    assert all(bool(enc_r.valid_mask[REWARD_OFFSET + j]) for j in range(6))
+    # Coexisting personalChoice and commandDraft live in disjoint token ranges
+    assert enc_r.action_tree.src_keys[TYPE_CHOICE] == [CHOICE_OFFSET + 0, CHOICE_OFFSET + 1]
+    assert enc_r.action_tree.src_keys[TYPE_COMMAND_CHOICE] == [CMD_CHOICE_OFFSET + 0, CMD_CHOICE_OFFSET + 1]
+    assert bool(enc_r.valid_mask[CHOICE_OFFSET + 0]) and bool(enc_r.valid_mask[CMD_CHOICE_OFFSET + 0])
+    # 6-slot equip operator encodes all 6 item IDs and all 6 replace slots round-trip + evaluate cleanly
+    board_tok = BOARD_OFFSET + path_idx
+    assert int(enc_r.cat_ids[board_tok, CAT_EQUIP5]) > 0
+    assert enc_r.action_tree.opt_keys[(TYPE_EQUIP, HAND_OFFSET, board_tok)] == [0, 1, 2, 3, 4, 5]
+    for ak, tup in enumerate(enc_r.action_tree.key_to_tuple):
+        assert enc_r.action_tree.decode(*tup) == ak
+    # Compact action indexing parity for 6-slot equip + 6-slot reward + commandChoice
+    reg_comp = copy.deepcopy(reg_frame)
+    del reg_comp["actions"]
+    reg_comp["cactions"] = [
+        [0],
+        *[[9, j] for j in range(6)],
+        [13, 0],
+        [13, 1],
+        [12, 0],
+        [12, 1],
+        *[[7, 501, 301, 400 + j] for j in range(6)],
+    ]
+    enc_rc = encode_frame(reg_comp, cat)
+    assert enc_rc.action_tree.to_mask_spec() == enc_r.action_tree.to_mask_spec()
+    assert enc_rc.action_tree.key_to_tuple == enc_r.action_tree.key_to_tuple
+    # Bounty & doll runtime effects resolve via iconId fallback (non-zero CAT_ENTITY)
+    assert int(enc_r.cat_ids[EFFECT_OFFSET + 0, CAT_ENTITY]) > 0
+    assert int(enc_r.cat_ids[EFFECT_OFFSET + 1, CAT_ENTITY]) > 0
+    # Inactive soloShip (cnt=2) must NOT be marked at_max_tier; mode_single_1 (no hiddenRound) must NOT set MATCH_STAGE[24]
+    solo_bi = cat.bond_to_idx["soloShip"]
+    assert float(enc_r.cont_feats[BOND_OFFSET + solo_bi, 11]) == 0.0
+    assert float(enc_r.cont_feats[MATCH_STAGE_IDX, 24]) == 0.0
+    # Model forward + act_single + evaluate_batch work cleanly with 121 tokens, 12 cat fields, 6 sub-opts
+    tiny_model = StrongholdPolicyNet(catalog=cat, config=PolicyConfig(d_model=64, n_heads=4, n_layers=2, dim_ff=128))
+    tiny_model.eval()
+    act = tiny_model.act_single(enc_r, deterministic=False)
+    a_t, a_s, a_g, a_o = act["action_tuple"]
+    assert enc_r.action_tree.decode(a_t, a_s, a_g, a_o) == act["action_key"]
