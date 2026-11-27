@@ -39,7 +39,7 @@ NORMAL 读取本次 BC，HARD 读取本次 NORMAL best，ABYSS 读取本次 HARD
 
 ### BC 均衡开局数据
 
-默认 `BC_OPENING_POLICY=balanced`，数据缓存改为：
+默认 `BC_OPENING_POLICY=balanced`、`BC_EPOCHS=10`，数据缓存改为：
 
 ```text
 data/v2feat_solo_1_8_1200ep_balanced_v1.pt
