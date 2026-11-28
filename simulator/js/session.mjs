@@ -4,6 +4,7 @@ import { config, data, source, COOP_MODES, ALL_MODES, isSoloMode } from './conte
 import { Match } from '../engine/server/match/Match.js';
 import { VirtualScheduler } from '../engine/server/match/scheduler.js';
 import { actionsFor } from './candidates.mjs';
+import { disableClientOutput } from './headless.mjs';
 
 const MAX_SCHEDULER_STEPS = 200000;
 const DIR_TO_IDX = { RIGHT: 0, UP: 1, LEFT: 2, DOWN: 3 };
@@ -220,7 +221,8 @@ function compactActions(actions) {
 }
 
 export class RoomSession {
-  constructor() {
+  constructor({ headless = true } = {}) {
+    this.headless = headless;
     this.modeId = null;
     this.policyVersion = null;
     this.compact = false;
@@ -476,6 +478,7 @@ export class RoomSession {
         },
       },
     });
+    if (this.headless) disableClientOutput(this.match);
     const collect = this.match._collectSimErrors.bind(this.match);
     this.match._collectSimErrors = (f, r) => {
       this.collected++;

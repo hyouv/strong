@@ -11,7 +11,15 @@ import { OK, fail } from './player/common.js';
 
 export const paramsOf = b => ({ ...b.bb, ...b.bbStr });
 export const skillRows = ps => Object.values(ps.gd.raw.bands || {}).flatMap(b => b.skills || []);
-export const commandSkill = ps => ps.command ? skillRows(ps).find(s => s.effectId === ps.command.currentEffectId) || null : null;
+// Read the live records in their existing order without rebuilding the entire skill table.
+// No cache: plugin/data edits and command swaps remain visible immediately.
+function skillById(ps, effectId) {
+  for (const band of Object.values(ps.gd.raw.bands || {})) {
+    for (const skill of band.skills || []) if (skill.effectId === effectId) return skill;
+  }
+  return null;
+}
+export const commandSkill = ps => ps.command ? skillById(ps, ps.command.currentEffectId) : null;
 
 /**
  * The effect-id map both the battle input and the bond/command displays read.
@@ -64,7 +72,7 @@ export function syncCommand(ps) {
       : s.unlockType === 'band_skill_load_by_coin_cost' ? ps.stats.gold >= Number(a)
       : s.unlockType === 'band_skill_load_by_bond_act_count' ? (ps.bonds[a]?.count || 0) >= Number(b) : false;
     if (!unlocked) break;
-    const next = skillRows(ps).find(row => row.effectId === s.next);
+    const next = skillById(ps, s.next);
     if (!next) break;
     const old = ps.command.records[s.effectId];
     activate(ps, next);
@@ -203,7 +211,7 @@ export function pickCommandDraft(ps, id, idx) {
   const gate = ps._gate(); if (gate) return gate;
   const draft = ps.commandDrafts?.[0];
   if (!draft || draft.id !== id || !Number.isInteger(idx) || !draft.cards[idx]) return fail(ERR.BAD_TARGET);
-  const skill = skillRows(ps).find(s => s.effectId === draft.cards[idx]);
+  const skill = skillById(ps, draft.cards[idx]);
   if (!skill) return fail(ERR.BAD_TARGET);
   activate(ps, skill);
   ps.command.swapped = true;
@@ -217,7 +225,7 @@ export function commandDraftView(ps) {
   const draft = ps.commandDrafts?.[0];
   if (!draft) return null;
   return { ...draft, cards: draft.cards.map(id => {
-    const s = skillRows(ps).find(row => row.effectId === id);
+    const s = skillById(ps, id);
     return { effectId: id, desc: s.desc, descRaw: s.descRaw, cost: s.cost };
   }) };
 }
