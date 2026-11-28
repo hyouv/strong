@@ -49,6 +49,7 @@ class PPOConfig:
     ent_coef: float = 0.01
     strategic_ent_mult: float = 1.0   # extra entropy weight on macro-strategic steps (band/bond/SP/choice)
     strategic_ent_coef: float = 0.0   # decoupled entropy bonus over strategic transitions only (prevents PREP dilution)
+    band_diversity_coef: float = 0.0  # KL(legal-uniform marginal || mean opening policy); 0 disables
     src_ent_weight: float = 0.5       # weight of step-2 source-pointer entropy on non-strategic steps
     tgt_ent_weight: float = 0.15      # weight of step-3 target-pointer entropy (prevents 36-tile MOVE entropy hacking)
     opt_ent_weight: float = 0.15      # weight of step-4 facing/replace-slot entropy on non-strategic steps
@@ -660,6 +661,27 @@ def collect_ppo_rollouts(
     return batch, stats
 
 
+def band_diversity_loss(log_probs: torch.Tensor, legal_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Penalize batch-level band collapse without requiring each state to be random.
+
+    Each opening contributes one probability vector. The target is the mean of
+    per-opening legal-uniform distributions, so unavailable bands get no target
+    mass. Compute KL(target || mean policy) in log space: unlike Shannon entropy,
+    this retains a useful gradient when a legal band's probability is almost zero.
+    """
+    if log_probs.ndim != 2 or log_probs.shape != legal_mask.shape or log_probs.shape[0] == 0:
+        raise ValueError("Expected a nonempty [openings, bands] distribution and matching mask")
+    if not bool(legal_mask.any(dim=1).all()):
+        raise ValueError("Every opening must have at least one legal band")
+    available = legal_mask.any(dim=0)
+    target = (legal_mask.float() / legal_mask.sum(dim=1, keepdim=True))[..., available].mean(dim=0)
+    # Drop globally unavailable columns before logsumexp to avoid all -inf gradients.
+    legal_lp = log_probs[:, available].masked_fill(~legal_mask[:, available], -torch.inf)
+    marginal_lp = torch.logsumexp(legal_lp, dim=0) - math.log(log_probs.shape[0])
+    loss = (target * (target.log() - marginal_lp)).sum()
+    return loss, marginal_lp
+
+
 def ppo_update(
     model: StrongholdPolicyNet,
     optimizer: torch.optim.Optimizer,
@@ -675,6 +697,15 @@ def ppo_update(
         torch.set_float32_matmul_precision("high")
     model.train()
     n = int(rollout["a_type"].shape[0])
+    if not math.isfinite(c.band_diversity_coef) or c.band_diversity_coef < 0:
+        raise ValueError("band_diversity_coef must be finite and nonnegative")
+    band_rows = (rollout["a_type"] == TYPE_BAND) & rollout["has_band"]
+    opening_batch = None
+    if c.band_diversity_coef > 0 and not critic_only and bool(band_rows.any()):
+        opening_batch = {
+            k: rollout[k][band_rows].to(device)
+            for k in ("cat_ids", "cont_feats", "valid_mask", "band_mask")
+        }
 
     saved_req_grad: list[tuple[nn.Parameter, bool]] = []
     if critic_only:
@@ -690,6 +721,9 @@ def ppo_update(
     sum_strat_ent = 0.0
     n_strat_batches = 0
     sum_open_ent = 0.0
+    sum_band_diversity = 0.0
+    sum_band_marginal_ent = 0.0
+    sum_band_max_prob = 0.0
     n_open_batches = 0
     sum_kl_bc = 0.0
     sum_approx_kl = 0.0
@@ -747,6 +781,17 @@ def ppo_update(
                 else:
                     explore_ent_vec = substep_ent
                 weighted_entropy = explore_ent_vec.mean()
+                diversity_loss = torch.zeros((), device=device)
+                if opening_batch is not None:
+                    # Use all openings, not the few that happen to land in this
+                    # transition minibatch. This avoids PREP dilution and noisy
+                    # minibatch balance targets. It shares the PPO optimizer step.
+                    diversity_loss, marginal_lp = band_diversity_loss(
+                        model.band_log_probs(opening_batch), opening_batch["band_mask"]
+                    )
+                    with torch.no_grad():
+                        sum_band_marginal_ent += float(-(marginal_lp.exp() * marginal_lp).sum())
+                        sum_band_max_prob += float(marginal_lp.exp().max())
 
                 if critic_only:
                     policy_loss = torch.zeros((), device=device)
@@ -773,6 +818,7 @@ def ppo_update(
                         - c.ent_coef * weighted_entropy
                         - c.strategic_ent_coef * strat_ent_bonus
                         + c.kl_coef * kl_bc
+                        + c.band_diversity_coef * diversity_loss
                     )
 
                 optimizer.zero_grad(set_to_none=True)
@@ -782,6 +828,7 @@ def ppo_update(
                 optimizer.step()
 
                 sum_ploss += float(policy_loss.item())
+                sum_band_diversity += float(diversity_loss.detach())
                 sum_vloss += float(value_loss.item())
                 sum_ent += float(entropy.item())
                 sum_explore_ent += float(weighted_entropy.item())
@@ -809,6 +856,9 @@ def ppo_update(
         "explore_entropy": sum_explore_ent / denom,
         "strategic_entropy": sum_strat_ent / max(1, n_strat_batches),
         "opening_entropy": sum_open_ent / max(1, n_open_batches),
+        "band_diversity_loss": sum_band_diversity / denom,
+        "band_marginal_entropy": sum_band_marginal_ent / denom,
+        "band_max_prob": sum_band_max_prob / denom,
         "kl_to_bc": sum_kl_bc / denom,
         "approx_kl": sum_approx_kl / denom,
         "clip_frac": sum_clip / denom,
@@ -842,6 +892,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--ent-coef-end", type=float, default=-1.0, help="Optional final entropy coef for linear annealing (<0 disables)")
     parser.add_argument("--strategic-ent-mult", type=float, default=1.0, help="Entropy multiplier on macro-strategic decisions")
     parser.add_argument("--strategic-ent-coef", type=float, default=0.0, help="Decoupled entropy bonus coef over strategic transitions only")
+    parser.add_argument("--band-diversity-coef", type=float, default=0.0, help="Batch opening-band KL penalty coefficient (0 disables)")
+    parser.add_argument("--band-diversity-coef-end", type=float, default=-1.0, help="Final band diversity coefficient for linear annealing (-1 keeps constant)")
     parser.add_argument("--strategic-ent-coef-end", type=float, default=-1.0, help="Optional final strategic_ent_coef for linear annealing (<0 disables)")
     parser.add_argument("--ban-bands", type=str, default="", help="Comma-separated opening bandIds to mask probabilistically during training (e.g. 'band_cannot')")
     parser.add_argument("--ban-band-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bands during training rollouts")
@@ -882,6 +934,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", type=str, default="checkpoints/ppo_solo_t1_last.pt")
     parser.add_argument("--best-out", type=str, default="", help="Optional path to save highest-win-rate eval checkpoint")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.band_diversity_coef) or args.band_diversity_coef < 0:
+        parser.error("--band-diversity-coef must be finite and nonnegative")
+    if not math.isfinite(args.band_diversity_coef_end) or (args.band_diversity_coef_end < 0 and args.band_diversity_coef_end != -1):
+        parser.error("--band-diversity-coef-end must be -1 or finite and nonnegative")
 
     modes = parse_solo_modes(args.modes)
     eval_modes = parse_solo_modes(args.eval_modes) if args.eval_modes else modes
@@ -943,6 +999,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ent_coef=args.ent_coef,
         strategic_ent_mult=args.strategic_ent_mult,
         strategic_ent_coef=args.strategic_ent_coef,
+        band_diversity_coef=args.band_diversity_coef,
         src_ent_weight=args.src_ent_weight,
         tgt_ent_weight=args.tgt_ent_weight,
         opt_ent_weight=args.opt_ent_weight,
@@ -1026,6 +1083,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cur_lr = args.lr
                 cur_ent = args.ent_coef
                 cur_strat_ent = args.strategic_ent_coef
+                cur_band_diversity = args.band_diversity_coef
                 cur_kl = args.kl_coef if ref_model is not None else 0.0
             else:
                 rl_step = upd - warmup - 1
@@ -1039,6 +1097,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if args.strategic_ent_coef_end >= 0.0
                     else args.strategic_ent_coef
                 )
+                cur_band_diversity = (
+                    _schedule_linear(args.band_diversity_coef, args.band_diversity_coef_end, prog)
+                    if args.band_diversity_coef_end >= 0 else args.band_diversity_coef
+                )
                 if ref_model is not None:
                     kl_prog = min(1.0, rl_step / max(1, args.kl_anneal_updates)) if args.kl_anneal_updates > 0 else prog
                     cur_kl = _schedule_linear(args.kl_coef, args.kl_coef_end, kl_prog) if args.kl_coef_end >= 0.0 else args.kl_coef
@@ -1048,6 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     pg["lr"] = cur_lr
                 ppo_cfg.ent_coef = cur_ent
                 ppo_cfg.strategic_ent_coef = cur_strat_ent
+                ppo_cfg.band_diversity_coef = cur_band_diversity
                 ppo_cfg.kl_coef = cur_kl
 
             ep_modes = build_curriculum_episode_modes(
@@ -1123,6 +1186,27 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"kl_bc={u_stats['kl_to_bc']:.4f} clip={u_stats['clip_frac']*100:.1f}%{sched_info}{stop_flag}",
                 flush=True,
             )
+
+            band_rows = (rollout["a_type"] == TYPE_BAND) & rollout["has_band"]
+            if bool(band_rows.any()):
+                counts = torch.bincount(rollout["a_src"][band_rows], minlength=cat.num_bands)
+                shares = counts.float() / counts.sum()
+                used = shares > 0
+                sample_entropy = float(-(shares[used] * shares[used].log()).sum())
+                band_counts = {cat.band_ids[i]: int(counts[i]) for i in used.nonzero().flatten().tolist()}
+                diversity_info = (
+                    f"div_c={cur_band_diversity:.6g} div_kl={u_stats['band_diversity_loss']:.4f} "
+                    f"mean_ent={u_stats['band_marginal_entropy']:.3f} "
+                    f"mean_pmax={u_stats['band_max_prob']:.3f} "
+                    if not is_warmup and cur_band_diversity > 0 else "div=off "
+                )
+                print(
+                    f"[{tag}] BAND n={int(counts.sum())} used={int(used.sum())} "
+                    f"max_share={float(shares.max()):.3f} sample_ent={sample_entropy:.3f} "
+                    f"{diversity_info}"
+                    f"counts={json.dumps(band_counts, ensure_ascii=False, sort_keys=True)}",
+                    flush=True,
+                )
 
             if args.save_every > 0 and upd % args.save_every == 0:
                 save_checkpoint(model, args.out, extra={"update": upd, "modes": list(modes), "device": device})

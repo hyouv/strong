@@ -618,6 +618,15 @@ class StrongholdPolicyNet(nn.Module):
         """Autoregressively sample one legal composite action for a single EncodedFrame."""
         return self.act_batch([enc], deterministic=deterministic, temperature=temperature, device=device)[0]
 
+    def band_log_probs(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate only the opening BAND distribution, using the rollout's legal masks."""
+        h = self.encode_tokens(batch["cat_ids"], batch["cont_feats"], batch["valid_mask"])
+        g_pol = h[:, POLICY_CLS_IDX]
+        a_type = torch.full((h.shape[0],), TYPE_BAND, dtype=torch.long, device=h.device)
+        ctx = self.src_ctx_proj(torch.cat([g_pol, self.type_emb(a_type)], dim=-1))
+        log_probs, _ = _masked_log_softmax_and_entropy(self.band_head(ctx), batch["band_mask"])
+        return log_probs
+
     def evaluate_batch(
         self,
         batch: dict[str, torch.Tensor],

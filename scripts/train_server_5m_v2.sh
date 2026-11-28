@@ -81,6 +81,8 @@ PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-1024}"
 PPO_EPOCHS="${PPO_EPOCHS:-2}"
 PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 PPO_TARGET_KL="${PPO_TARGET_KL:-0.04}"
+PPO_BAND_DIVERSITY_COEF="${PPO_BAND_DIVERSITY_COEF:-0.0}"
+PPO_BAND_DIVERSITY_COEF_END="${PPO_BAND_DIVERSITY_COEF_END:--1}"
 PPO_GAMMA_ROUND="${PPO_GAMMA_ROUND:-0.97}"
 PPO_GAE_LAMBDA_INTRA="${PPO_GAE_LAMBDA_INTRA:-0.99}"
 
@@ -301,6 +303,8 @@ run_normal() {
     --ent-coef-end "${NORMAL_ENT_COEF_END}" \
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${NORMAL_STRATEGIC_ENT_COEF}" \
+    --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
+    --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
     --strategic-ent-coef-end "${NORMAL_STRATEGIC_ENT_COEF_END}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
@@ -362,6 +366,8 @@ run_hard() {
     --ent-coef-end "${HARD_ENT_COEF_END}" \
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${HARD_STRATEGIC_ENT_COEF}" \
+    --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
+    --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
     --strategic-ent-coef-end "${HARD_STRATEGIC_ENT_COEF_END}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
@@ -423,6 +429,8 @@ run_abyss() {
     --ent-coef-end "${ABYSS_ENT_COEF_END}" \
     --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}" \
     --strategic-ent-coef "${ABYSS_STRATEGIC_ENT_COEF}" \
+    --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
+    --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
     --strategic-ent-coef-end "${ABYSS_STRATEGIC_ENT_COEF_END}" \
     --ban-bands "${ABYSS_BAN_BANDS}" \
     --ban-band-prob "${ABYSS_BAN_BAND_PROB}" \

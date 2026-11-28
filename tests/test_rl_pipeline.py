@@ -204,6 +204,7 @@ def test_bc_cold_start_and_masked_ppo_smoke(tmp_path: Path) -> None:
         max_prep_steps_per_round=40,
         kl_coef=0.05,
         target_kl=0.05,
+        band_diversity_coef=0.001,
     )
     rollout, r_stats = collect_ppo_rollouts(
         loaded,
@@ -226,12 +227,15 @@ def test_bc_cold_start_and_masked_ppo_smoke(tmp_path: Path) -> None:
     assert torch.equal(loaded.type_head[0].weight.detach(), actor_before)
     assert not torch.equal(loaded.value_head[0].weight.detach(), critic_before)
     assert w_stats["policy_loss"] == 0.0
+    assert w_stats["band_diversity_loss"] == 0.0
 
     opt = torch.optim.AdamW(loaded.parameters(), lr=5e-5)
     u_stats = ppo_update(loaded, opt, rollout, cfg=ppo_cfg, critic_only=False)
     assert all(torch.isfinite(torch.tensor(v)) for v in u_stats.values())
     assert u_stats["kl_to_bc"] >= 0.0
     assert u_stats["approx_kl"] >= 0.0
+    assert u_stats["band_diversity_loss"] > 0.0
+    assert u_stats["band_marginal_entropy"] > 0.0
 
 
 def test_async_actor_pool_rollout_and_eval_parity() -> None:
