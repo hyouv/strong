@@ -9,7 +9,7 @@ Headless game simulator for **明日方舟：卫戍协议（规程·序列Ⅰ `a
 ├── config/
 │   └── regulation.json          # Pinned ruleset metadata (act3autochess@V3_1)
 ├── simulator/
-│   ├── engine/                  # Unmodified upstream Stronghold-Protocol JS core (~12.5 MB)
+│   ├── engine/                  # Vendored Stronghold-Protocol JS core (~12.5 MB)
 │   └── js/                      # Refactored headless JS worker & RL interface
 │       ├── context.mjs          # Pure-JS rules/data loader (no git subprocesses)
 │       ├── strategy_actions.mjs # Strategy/command action enumeration & C2S validation
@@ -44,6 +44,9 @@ All dependencies are confined inside the repository:
 Run tests:
 
 ```powershell
-.\.tools\node\node.exe --test tests/test_js_simulator.mjs
+.\.tools\node\node.exe --test tests/test_js_simulator.mjs tests/test_headless.mjs
 .\.venv\Scripts\python.exe -m pytest -v
 ```
+
+Simulator profiling, fixed-action replay benchmarks, and the headless optimizations are
+documented in [docs/SIMULATOR_PERFORMANCE.md](docs/SIMULATOR_PERFORMANCE.md).
