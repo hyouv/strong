@@ -9,7 +9,8 @@
 #   Stage 3 (hard):   Masked PPO on mode_single_9..14 with L1..8 anchor replay (25% -> 8%).
 #   Stage 4 (abyss):  Masked PPO on mode_single_15..20 with L1..14 anchor replay (30% -> 12%).
 #
-# Anti-collapse safeguards active across EVERY PPO stage (general, zero hardcoded band/bond/boss bans):
+# Anti-collapse safeguards active across EVERY PPO stage:
+#   L1-4 training episodes (including curriculum replay) mask weakness by default; eval stays unrestricted.
 #   1. Unified 1-8 BC avoids 1-map / 18-bond T1-only early lock-in (egirShip & kazimierzShip active from step 0).
 #   2. Decoupled --strategic-ent-coef protects opening BAND_DRAFT / INFO_CHECK / SP_DRAFT / CHOICE entropy
 #      from 300:1 PREP-step dilution (watch `o_ent` in logs; healthy range ~0.6-2.5 during training).
@@ -83,6 +84,7 @@ PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 PPO_TARGET_KL="${PPO_TARGET_KL:-0.04}"
 PPO_BAND_DIVERSITY_COEF="${PPO_BAND_DIVERSITY_COEF:-0.0}"
 PPO_BAND_DIVERSITY_COEF_END="${PPO_BAND_DIVERSITY_COEF_END:--1}"
+PPO_TIER1_BAN_BANDS="${PPO_TIER1_BAN_BANDS-band_weakness}"
 PPO_GAMMA_ROUND="${PPO_GAMMA_ROUND:-0.97}"
 PPO_GAE_LAMBDA_INTRA="${PPO_GAE_LAMBDA_INTRA:-0.99}"
 
@@ -305,6 +307,7 @@ run_normal() {
     --strategic-ent-coef "${NORMAL_STRATEGIC_ENT_COEF}" \
     --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
     --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
+    --tier1-ban-bands "${PPO_TIER1_BAN_BANDS}" \
     --strategic-ent-coef-end "${NORMAL_STRATEGIC_ENT_COEF_END}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
@@ -368,6 +371,7 @@ run_hard() {
     --strategic-ent-coef "${HARD_STRATEGIC_ENT_COEF}" \
     --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
     --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
+    --tier1-ban-bands "${PPO_TIER1_BAN_BANDS}" \
     --strategic-ent-coef-end "${HARD_STRATEGIC_ENT_COEF_END}" \
     --src-ent-weight "${PPO_SRC_ENT_WEIGHT}" \
     --tgt-ent-weight "${PPO_TGT_ENT_WEIGHT}" \
@@ -431,6 +435,7 @@ run_abyss() {
     --strategic-ent-coef "${ABYSS_STRATEGIC_ENT_COEF}" \
     --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}" \
     --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}" \
+    --tier1-ban-bands "${PPO_TIER1_BAN_BANDS}" \
     --strategic-ent-coef-end "${ABYSS_STRATEGIC_ENT_COEF_END}" \
     --ban-bands "${ABYSS_BAN_BANDS}" \
     --ban-band-prob "${ABYSS_BAN_BAND_PROB}" \

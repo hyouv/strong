@@ -76,6 +76,7 @@ class PPOConfig:
     # Opening diversity exploration (training-only legal-mask filtering; never applied in eval)
     ban_bands: tuple[str, ...] = ()
     ban_band_prob: float = 0.0
+    tier1_ban_bands: tuple[str, ...] = ("band_weakness",)  # mandatory for L1-4 training, including replay mix
     ban_bond_groups: tuple[str, ...] = ()
     ban_bond_group_prob: float = 0.0
 
@@ -366,6 +367,12 @@ def collect_ppo_rollouts(
     for bid in cfg.ban_bond_groups:
         if bid not in cat.bond_to_idx:
             raise ValueError(f"Unknown bondId in ban_bond_groups: {bid!r}")
+    tier1_ban_idxs: list[int] = []
+    for bid in cfg.tier1_ban_bands:
+        if bid not in cat.band_to_idx:
+            raise ValueError(f"Unknown bandId in tier1_ban_bands: {bid!r}")
+        tier1_ban_idxs.append(cat.band_to_idx[bid])
+    mode_ban_band_idxs = {mode: tuple(tier1_ban_idxs) for mode in SOLO_TIER1_MODES} if tier1_ban_idxs else {}
 
     if pool is not None or (use_async_pool and n_workers >= 2):
         def _run_with_pool(active_pool: AsyncActorPool) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
@@ -389,6 +396,7 @@ def collect_ppo_rollouts(
                 ban_band_prob=cfg.ban_band_prob,
                 ban_bond_ids=cfg.ban_bond_groups,
                 ban_bond_prob=cfg.ban_bond_group_prob,
+                mode_ban_band_idxs=mode_ban_band_idxs,
                 max_prep_steps_per_round=cfg.max_prep_steps_per_round,
                 sampling_temperature=sampling_temperature,
                 min_batch=min_batch if min_batch > 0 else None,
@@ -519,13 +527,14 @@ def collect_ppo_rollouts(
                             repeat_states += 1
                             if cfg.repeat_state_penalty != 0.0:
                                 ep_buf[w][-1].reward += cfg.repeat_state_penalty
-                    if ep_ban_bands[w] or ep_ban_bonds[w]:
+                    if ep_ban_bands[w] or ep_ban_bonds[w] or (mode_ban_band_idxs and frame["phase"] == "BAND_DRAFT"):
                         spec = enc.action_tree.to_mask_spec()
                         masked = mask_opening_diversity(
                             frame,
                             spec,
                             ban_band_idxs=ep_ban_bands[w],
                             ban_bond_ids=ep_ban_bonds[w],
+                            mode_ban_band_idxs=mode_ban_band_idxs,
                         )
                         if masked is not spec:
                             new_tm = torch.tensor(list(masked.type_mask_bytes), dtype=torch.bool)
@@ -897,6 +906,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--strategic-ent-coef-end", type=float, default=-1.0, help="Optional final strategic_ent_coef for linear annealing (<0 disables)")
     parser.add_argument("--ban-bands", type=str, default="", help="Comma-separated opening bandIds to mask probabilistically during training (e.g. 'band_cannot')")
     parser.add_argument("--ban-band-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bands during training rollouts")
+    parser.add_argument("--tier1-ban-bands", type=str, default="band_weakness", help="Always ban these bandIds in L1-4 training episodes, including replay mix; empty string disables; evaluation stays unrestricted")
     parser.add_argument("--ban-bond-groups", type=str, default="", help="Comma-separated core bondIds whose INFO_CHECK group is masked probabilistically (e.g. 'lethaniaShip')")
     parser.add_argument("--ban-bond-group-prob", type=float, default=0.0, help="Per-episode probability of masking --ban-bond-groups during training rollouts")
     parser.add_argument("--src-ent-weight", type=float, default=0.5, help="Non-strategic step-2 source-pointer entropy weight")
@@ -944,6 +954,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     mix_modes = parse_solo_modes(args.mix_modes) if args.mix_modes else ()
     boss_weights = parse_boss_weights(args.boss_weights)
     ban_bands = parse_id_list(args.ban_bands)
+    tier1_ban_bands = parse_id_list(args.tier1_ban_bands)
     ban_bond_groups = parse_id_list(args.ban_bond_groups)
     device = resolve_device(args.device)
     print(
@@ -951,6 +962,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         + (f" | mix={mix_modes} ({args.mix_ratio_start:.2f}->{args.mix_ratio_end:.2f})" if mix_modes else "")
         + (f" | boss_weights={boss_weights}" if boss_weights else "")
         + (f" | ban_bands={ban_bands}@{args.ban_band_prob:.2f}" if (ban_bands and args.ban_band_prob > 0.0) else "")
+        + (f" | tier1_ban_bands={tier1_ban_bands} (train only)" if tier1_ban_bands else "")
         + (f" | ban_bonds={ban_bond_groups}@{args.ban_bond_group_prob:.2f}" if (ban_bond_groups and args.ban_bond_group_prob > 0.0) else ""),
         flush=True,
     )
@@ -1017,6 +1029,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         boss_dmg_defeat_bonus=args.boss_dmg_defeat_bonus,
         ban_bands=ban_bands,
         ban_band_prob=args.ban_band_prob,
+        tier1_ban_bands=tier1_ban_bands,
         ban_bond_groups=ban_bond_groups,
         ban_bond_group_prob=args.ban_bond_group_prob,
     )

@@ -177,17 +177,23 @@ def mask_opening_diversity(
     *,
     ban_band_idxs: frozenset[int] = frozenset(),
     ban_bond_ids: frozenset[str] = frozenset(),
+    mode_ban_band_idxs: Mapping[str, Sequence[int]] | None = None,
 ) -> ActionMaskSpec:
     """Optionally mask dominant opening bands or core bond groups during training rollouts.
 
-    Strictly preserves at least one legal option and returns an exact `ActionMaskSpec` so
-    PPO `old_log_prob` and `evaluate_batch` stay 100% on-policy.
+    Mode-specific bans are mandatory; probabilistic bans may relax if necessary
+    to preserve an option. Returns the exact behavior mask for PPO log-prob parity.
     """
     phase = frame.get("phase")
-    if phase == "BAND_DRAFT" and ban_band_idxs:
+    if phase == "BAND_DRAFT" and (ban_band_idxs or mode_ban_band_idxs):
         band_srcs = mask_spec.src_keys.get(TYPE_BAND)
         if band_srcs:
-            kept = [idx for idx in band_srcs if idx not in ban_band_idxs]
+            mode_id = (frame.get("pub") or {}).get("modeId")
+            fixed_bans = (mode_ban_band_idxs or {}).get(mode_id, ())
+            allowed = [idx for idx in band_srcs if idx not in fixed_bans]
+            if not allowed:
+                raise ValueError(f"Mode-specific band bans leave no legal band in {mode_id}")
+            kept = [idx for idx in allowed if idx not in ban_band_idxs] or allowed
             if kept and len(kept) < len(band_srcs):
                 new_src_keys = dict(mask_spec.src_keys)
                 new_src_keys[TYPE_BAND] = kept
@@ -272,6 +278,7 @@ def _actor_worker_main(
         timeout_penalized_round = False
         ep_ban_band_idxs: frozenset[int] = frozenset()
         ep_ban_bond_ids: frozenset[str] = frozenset()
+        ep_mode_ban_band_idxs: Mapping[str, Sequence[int]] = {}
         base_det = False
         base_temp = 1.0
 
@@ -348,12 +355,13 @@ def _actor_worker_main(
                 req_det = base_det
                 req_temp = base_temp
                 obs_mask_spec = dec.mask_spec
-                if ep_ban_band_idxs or ep_ban_bond_ids:
+                if ep_ban_band_idxs or ep_ban_bond_ids or ep_mode_ban_band_idxs:
                     obs_mask_spec = mask_opening_diversity(
                         frame,
                         obs_mask_spec,
                         ban_band_idxs=ep_ban_band_idxs,
                         ban_bond_ids=ep_ban_bond_ids,
+                        mode_ban_band_idxs=ep_mode_ban_band_idxs,
                     )
 
                 # Local fast-path 2: deterministic eval cycle-breaker
@@ -427,6 +435,8 @@ def _actor_worker_main(
                 track_repeat_states = bool(cfg.get("track_repeat_states", False))
                 base_det = bool(cfg["deterministic"])
                 base_temp = float(cfg["temperature"])
+                # Evaluation resets omit this config, clearing all training-only bans.
+                ep_mode_ban_band_idxs = cfg.get("mode_ban_band_idxs") or {}
                 ban_band_pool: tuple[int, ...] = tuple(cfg.get("ban_band_idxs") or ())
                 ban_band_prob = float(cfg.get("ban_band_prob") or 0.0)
                 ban_bond_pool: tuple[str, ...] = tuple(cfg.get("ban_bond_ids") or ())
@@ -712,6 +722,7 @@ class AsyncActorPool:
         ban_band_prob: float = 0.0,
         ban_bond_ids: Sequence[str] = (),
         ban_bond_prob: float = 0.0,
+        mode_ban_band_idxs: Mapping[str, Sequence[int]] | None = None,
         max_prep_steps_per_round: int = 80,
         sampling_temperature: float = 1.0,
         min_batch: int | None = None,
@@ -737,6 +748,7 @@ class AsyncActorPool:
             "ban_band_prob": float(ban_band_prob),
             "ban_bond_ids": tuple(str(b) for b in ban_bond_ids),
             "ban_bond_prob": float(ban_bond_prob),
+            "mode_ban_band_idxs": {m: tuple(ids) for m, ids in (mode_ban_band_idxs or {}).items()},
         }
 
         all_episodes: list[list[dict[str, Any]]] = []

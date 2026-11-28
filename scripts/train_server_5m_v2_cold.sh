@@ -29,6 +29,8 @@ EASY_LR=1e-4 -> EASY_LR_END=2.5e-5; EASY_ENT_COEF=0.01 -> 0.003.
 EASY_EVAL_EPISODES=64, INIT_SEED=110000, EASY_SEED=110000.
 Optional batch band diversity: PPO_BAND_DIVERSITY_COEF=0.001
 (default 0 disables; PPO_BAND_DIVERSITY_COEF_END=-1 keeps it constant).
+L1-4 training always masks band_weakness, including later-stage replay episodes.
+PPO_TIER1_BAN_BANDS overrides this comma list; an empty value disables it. Eval is unrestricted.
 Shared PPO_*, evaluation, architecture, and later-stage overrides use the same
 environment names as train_server_5m_v2.sh. Dropout is always zero for PPO.
 DRY_RUN=1 prints the easy command and later-stage launcher configuration only;
@@ -94,6 +96,7 @@ export PPO_CRITIC_LR="${PPO_CRITIC_LR:-2e-4}"
 export PPO_TARGET_KL="${PPO_TARGET_KL:-0.04}"
 export PPO_BAND_DIVERSITY_COEF="${PPO_BAND_DIVERSITY_COEF:-0.0}"
 export PPO_BAND_DIVERSITY_COEF_END="${PPO_BAND_DIVERSITY_COEF_END:--1}"
+export PPO_TIER1_BAN_BANDS="${PPO_TIER1_BAN_BANDS-band_weakness}"
 export PPO_GAMMA_ROUND="${PPO_GAMMA_ROUND:-0.97}"
 export PPO_GAE_LAMBDA_INTRA="${PPO_GAE_LAMBDA_INTRA:-0.99}"
 export PPO_STEP_PENALTY="${PPO_STEP_PENALTY:--0.0005}"
@@ -122,6 +125,7 @@ easy_command=(
   --critic-lr "${PPO_CRITIC_LR}" --target-kl "${PPO_TARGET_KL}"
   --band-diversity-coef "${PPO_BAND_DIVERSITY_COEF}"
   --band-diversity-coef-end "${PPO_BAND_DIVERSITY_COEF_END}"
+  --tier1-ban-bands "${PPO_TIER1_BAN_BANDS}"
   --ent-coef "${EASY_ENT_COEF:-0.01}" --ent-coef-end "${EASY_ENT_COEF_END:-0.003}"
   --strategic-ent-mult "${PPO_STRATEGIC_ENT_MULT}"
   --strategic-ent-coef "${EASY_STRATEGIC_ENT_COEF:-0.0006}"
